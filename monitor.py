@@ -8,7 +8,7 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 from pathlib import Path
 import re
@@ -395,9 +395,10 @@ def main():
             return 0
         if args.sample_message:
             now = datetime.now(MSK)
-            start = now.replace(minute=0, second=0, microsecond=0) + timedelta(days=3, hours=2)
-            sample = Outage('SAMPLE', f'п {config.settlement}, ул Пихтовая; п {config.settlement}, ул Благодатная',
-                            start, start + timedelta(hours=6), 'Пример комментария с сайта')
+            # Дословно реальная (уже завершённая) запись 332251 с сайта: две улицы Песков.
+            sample = Outage('332251', 'п Пески, ул Пихтовая; п Пески, ул Благодатная',
+                            datetime(2026, 9, 25, 9, 0, tzinfo=MSK), datetime(2026, 9, 25, 17, 0, tzinfo=MSK),
+                            'Замена КТП 2073')
             for text in messages([sample], now, config):
                 send(text, config, parse_mode='HTML')
             return 0
