@@ -1,0 +1,14 @@
+[Unit]
+Description=Peski electricity outage notification
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+User=peski
+WorkingDirectory=/opt/peski-monitor
+EnvironmentFile=/etc/peski-monitor.env
+ExecStart=/opt/peski-monitor/.venv/bin/python /opt/peski-monitor/monitor.py
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
