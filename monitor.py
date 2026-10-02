@@ -296,7 +296,7 @@ def address_line(row, config=Config()):
                       + re.escape(config.settlement) + r"\s*$", re.I)
     parts = [a for a in row.address.split('; ') if a]
     if any(not bare.fullmatch(a) for a in parts):
-        return '; '.join(parts)
+        return '; '.join(parts) + f', {config.district} район'
     return f'пос.{config.label}'
 
 

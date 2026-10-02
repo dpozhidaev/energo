@@ -88,7 +88,7 @@ class Tests(unittest.TestCase):
             '\nИсточник: ' + config.source,
             'Плановое отключение электричества!\n'
             '06.10.2026 09:00 — 06.10.2026 12:00 МСК\n'
-            'Адрес: п Пески, ул Пихтовая; п Пески, ул Благодатная\n'
+            'Адрес: п Пески, ул Пихтовая; п Пески, ул Благодатная, Выборгский район\n'
             'Комментарий: не указан\n'
             'Запись: 2\n'
             'Проверка: 02.10.2026 09:00 МСК\n'
@@ -106,7 +106,7 @@ class Tests(unittest.TestCase):
         config = m.Config()
         row = m.Outage('1', 'п Пески, ул Пихтовая; п Пески, ул Благодатная',
                         datetime(2026, 10, 5, tzinfo=m.MSK), datetime(2026, 10, 5, 12, tzinfo=m.MSK), '')
-        self.assertEqual(m.address_line(row, config), 'п Пески, ул Пихтовая; п Пески, ул Благодатная')
+        self.assertEqual(m.address_line(row, config), 'п Пески, ул Пихтовая; п Пески, ул Благодатная, Выборгский район')
 
     def test_messages_truncated_to_telegram_limit(self):
         row = m.parse_page(page())[0][0]
