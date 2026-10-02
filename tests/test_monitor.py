@@ -105,6 +105,55 @@ class Tests(unittest.TestCase):
         self.assertIn('Комментарий: Авария &lt;важно&gt; &amp; срочно', text)
         self.assertNotIn('<важно>', text)
 
+    def test_real_record_with_two_peski_streets(self):
+        # Дословная строка записи 332251 с сайта: две улицы Песков в одной ячейке адреса.
+        real_row = '''<tr class="even" data-record-id="332251">
+<td>
+                        Ленинградская область                    </td>
+<td>
+                                                р-н Выборгский                    </td>
+<td class="rowStreets">
+<span>
+                            п Пески, ул Пихтовая</span><br/> <span> п Пески, ул Благодатная                        </span>
+</td>
+<td>
+                        25-09-2026                    </td>
+<td>
+                        09:00                    </td>
+<td>
+                        25-09-2026                    </td>
+<td>
+                        17:00                    </td>
+<td>
+                        Выборгские ЭС                    </td>
+<td>
+                        Рощинский РЭС                    </td>
+<td>
+                        Замена КТП 2073                    </td>
+<td class="rowFias text-nowrap">
+<small>
+                                                        1d15fa2f-cf8f-4142-b7ab-e3b32063f7bf</small><br/><small>db020341-c70e-4350-83bb-7438b83dae4e                                                    </small>
+</td>
+</tr>'''
+        html = ('<table class="tableous_facts"><thead><tr><th>Адрес Плановое время начала '
+                'Плановое время восстановления</th></tr></thead><tbody>' + real_row + '</tbody></table>')
+        config = m.Config()
+        rows, _, ids = m.parse_page(html, config)
+        self.assertEqual(ids, ('332251',))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].address, 'п Пески, ул Пихтовая; п Пески, ул Благодатная')
+        now = datetime(2026, 9, 24, 9, 0, tzinfo=m.MSK)
+        texts = m.messages(rows, now, config)
+        self.assertEqual(texts, [
+            '<b>⚡ Плановое отключение электричества!</b>\n'
+            '25.09.2026 09:00 — 25.09.2026 17:00 МСК\n'
+            'Адрес: п Пески, ул Пихтовая; п Пески, ул Благодатная, Выборгский район\n'
+            'Комментарий: Замена КТП 2073\n'
+            'Запись: 332251\n'
+            'Проверка: 24.09.2026 09:00 МСК\n'
+            '\nИсточник: ' + config.source,
+        ])
+
     def test_address_line_falls_back_for_bare_settlement_mentions(self):
         config = m.Config()
         bare = m.Outage('1', 'Пески', datetime(2026, 10, 5, tzinfo=m.MSK), datetime(2026, 10, 5, 12, tzinfo=m.MSK), '')
