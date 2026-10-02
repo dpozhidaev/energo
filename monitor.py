@@ -389,7 +389,8 @@ def main():
         if args.sample_message:
             now = datetime.now(MSK)
             start = now.replace(minute=0, second=0, microsecond=0) + timedelta(days=3, hours=2)
-            sample = Outage('SAMPLE', 'пример адреса с сайта', start, start + timedelta(hours=6), 'Пример комментария с сайта')
+            sample = Outage('SAMPLE', f'п {config.settlement}, ул Пихтовая; п {config.settlement}, ул Благодатная',
+                            start, start + timedelta(hours=6), 'Пример комментария с сайта')
             for text in messages([sample], now, config):
                 send(text, config)
             return 0
