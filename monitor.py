@@ -125,13 +125,15 @@ def parse_page(html, config=Config()):
         addresses = [clean(s) for s in cells[2].get_text('|', strip=True).split('|')]
         if not re.search(r'(?<!\w)' + re.escape(config.district) + r'(?!\w)', vals[1], re.I):
             continue
-        if not any(settlement.search(a) for a in addresses):
+        matches = [a for a in addresses if settlement.search(a)]
+        if not matches:
             continue
         start = datetime.strptime(vals[3] + ' ' + vals[4], '%d-%m-%Y %H:%M').replace(tzinfo=MSK)
         end = datetime.strptime(vals[5] + ' ' + vals[6], '%d-%m-%Y %H:%M').replace(tzinfo=MSK)
         if end < start:
             raise ValueError('Время окончания отключения раньше начала')
-        outages.append(Outage(row['data-record-id'], '; '.join(addresses), start, end, vals[9]))
+        # Только строки адреса, где встречается сам посёлок — остальные посёлки общей записи не нужны.
+        outages.append(Outage(row['data-record-id'], '; '.join(matches), start, end, vals[9]))
     pages = {1}
     for link in soup.select('a[href]'):
         label = link.get_text(strip=True)
@@ -287,6 +289,17 @@ def update_sent_state(sent, new_rows, limit=SENT_STATE_LIMIT):
     return (sent + [row.record_id for row in new_rows])[-limit:]
 
 
+def address_line(row, config=Config()):
+    """Строка с улицей, если она есть у посёлка в записи; иначе общий адрес посёлка и района.
+    Остальные посёлки общей записи сайта (row.address уже отфильтрован в parse_page) не выводятся."""
+    bare = re.compile(r"^(?:п\.?|пос\.?|поселок|посёлок|д\.?|деревня|с\.?|село|г\.?|город)?\s*"
+                      + re.escape(config.settlement) + r"\s*$", re.I)
+    parts = [a for a in row.address.split('; ') if a]
+    if any(not bare.fullmatch(a) for a in parts):
+        return '; '.join(parts)
+    return f'пос.{config.label}'
+
+
 def messages(rows, now, config=Config()):
     # Одно сообщение на запись: интересует только сам факт и время отключения в конкретном
     # посёлке, а не полный (часто на 10+ посёлков) список адресов из ячейки сайта.
@@ -295,7 +308,7 @@ def messages(rows, now, config=Config()):
         # Без parse_mode: текст сайта (комментарий) не становится HTML/Markdown.
         text = (f'Плановое отключение электричества!\n'
                 f'{row.start:%d.%m.%Y %H:%M} — {row.end:%d.%m.%Y %H:%M} МСК\n'
-                f'Адрес: пос.{config.label}\n'
+                f'Адрес: {address_line(row, config)}\n'
                 f'Комментарий: {row.comment or "не указан"}\n'
                 f'Запись: {row.record_id}\n'
                 f'Проверка: {now:%d.%m.%Y %H:%M} МСК\n'

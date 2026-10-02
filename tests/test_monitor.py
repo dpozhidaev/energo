@@ -72,10 +72,10 @@ class Tests(unittest.TestCase):
     def test_messages_one_per_record_with_fixed_address(self):
         config = m.Config()
         now = datetime(2026, 10, 2, 9, 0, tzinfo=m.MSK)
-        row1 = m.Outage('1', 'раздельный реальный адрес с сайта тут не используется',
+        row1 = m.Outage('1', 'Пески',
                          datetime(2026, 10, 5, 11, 0, tzinfo=m.MSK), datetime(2026, 10, 5, 17, 0, tzinfo=m.MSK),
                          'Плановые работы на линии электропередач')
-        row2 = m.Outage('2', 'другой адрес', datetime(2026, 10, 6, 9, 0, tzinfo=m.MSK),
+        row2 = m.Outage('2', 'п Пески, ул Пихтовая; п Пески, ул Благодатная', datetime(2026, 10, 6, 9, 0, tzinfo=m.MSK),
                          datetime(2026, 10, 6, 12, 0, tzinfo=m.MSK), '')
         texts = m.messages([row1, row2], now, config)
         self.assertEqual(texts, [
@@ -88,12 +88,25 @@ class Tests(unittest.TestCase):
             '\nИсточник: ' + config.source,
             'Плановое отключение электричества!\n'
             '06.10.2026 09:00 — 06.10.2026 12:00 МСК\n'
-            'Адрес: пос.Пески, Выборгский район\n'
+            'Адрес: п Пески, ул Пихтовая; п Пески, ул Благодатная\n'
             'Комментарий: не указан\n'
             'Запись: 2\n'
             'Проверка: 02.10.2026 09:00 МСК\n'
             '\nИсточник: ' + config.source,
         ])
+
+    def test_address_line_falls_back_for_bare_settlement_mentions(self):
+        config = m.Config()
+        bare = m.Outage('1', 'Пески', datetime(2026, 10, 5, tzinfo=m.MSK), datetime(2026, 10, 5, 12, tzinfo=m.MSK), '')
+        self.assertEqual(m.address_line(bare, config), 'пос.Пески, Выборгский район')
+        prefixed = m.Outage('2', 'п. Пески', datetime(2026, 10, 5, tzinfo=m.MSK), datetime(2026, 10, 5, 12, tzinfo=m.MSK), '')
+        self.assertEqual(m.address_line(prefixed, config), 'пос.Пески, Выборгский район')
+
+    def test_address_line_shows_streets_when_present(self):
+        config = m.Config()
+        row = m.Outage('1', 'п Пески, ул Пихтовая; п Пески, ул Благодатная',
+                        datetime(2026, 10, 5, tzinfo=m.MSK), datetime(2026, 10, 5, 12, tzinfo=m.MSK), '')
+        self.assertEqual(m.address_line(row, config), 'п Пески, ул Пихтовая; п Пески, ул Благодатная')
 
     def test_messages_truncated_to_telegram_limit(self):
         row = m.parse_page(page())[0][0]
