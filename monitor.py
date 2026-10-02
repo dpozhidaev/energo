@@ -2,6 +2,7 @@
 """Ежедневная сводка отключений в Песках. Python 3.11+."""
 import argparse
 import concurrent.futures
+import html
 import json
 import smtplib
 import ssl
@@ -305,11 +306,14 @@ def messages(rows, now, config=Config()):
     # посёлке, а не полный (часто на 10+ посёлков) список адресов из ячейки сайта.
     texts = []
     for row in rows:
-        # Без parse_mode: текст сайта (комментарий) не становится HTML/Markdown.
-        text = (f'Плановое отключение электричества!\n'
+        # parse_mode HTML только ради жирного заголовка; текст с сайта (адрес, комментарий)
+        # экранируем, иначе его спецсимволы сломают разметку или собьют всё сообщение.
+        address = html.escape(address_line(row, config))
+        comment = html.escape(row.comment) if row.comment else 'не указан'
+        text = (f'<b>⚡ Плановое отключение электричества!</b>\n'
                 f'{row.start:%d.%m.%Y %H:%M} — {row.end:%d.%m.%Y %H:%M} МСК\n'
-                f'Адрес: {address_line(row, config)}\n'
-                f'Комментарий: {row.comment or "не указан"}\n'
+                f'Адрес: {address}\n'
+                f'Комментарий: {comment}\n'
                 f'Запись: {row.record_id}\n'
                 f'Проверка: {now:%d.%m.%Y %H:%M} МСК\n'
                 f'\nИсточник: {config.source}')
@@ -341,11 +345,14 @@ def validate_destination(config):
         raise ValueError('Для email нужны SMTP_HOST, SMTP_USER, SMTP_PASSWORD и email_to')
 
 
-def send(text, config=Config()):
+def send(text, config=Config(), parse_mode=None):
     validate_destination(config)
     if config.channel == 'telegram':
         chat = os.environ.get('TELEGRAM_CHAT_ID') or config.telegram_chat_id
-        telegram('sendMessage', dict(chat_id=chat, text=text, link_preview_options={'is_disabled': True}))
+        payload = dict(chat_id=chat, text=text, link_preview_options={'is_disabled': True})
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        telegram('sendMessage', payload)
         return
     message = EmailMessage()
     message['Subject'] = f'Отключения электричества: {config.label}'
@@ -392,7 +399,7 @@ def main():
             sample = Outage('SAMPLE', f'п {config.settlement}, ул Пихтовая; п {config.settlement}, ул Благодатная',
                             start, start + timedelta(hours=6), 'Пример комментария с сайта')
             for text in messages([sample], now, config):
-                send(text, config)
+                send(text, config, parse_mode='HTML')
             return 0
         if not args.dry_run:
             validate_destination(config)
@@ -407,7 +414,7 @@ def main():
             if args.dry_run:
                 print(text)
             else:
-                send(text, config)
+                send(text, config, parse_mode='HTML')
         if not args.dry_run:
             save_sent_state(update_sent_state(sent, new_rows))
         return 0

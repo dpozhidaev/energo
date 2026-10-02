@@ -79,14 +79,14 @@ class Tests(unittest.TestCase):
                          datetime(2026, 10, 6, 12, 0, tzinfo=m.MSK), '')
         texts = m.messages([row1, row2], now, config)
         self.assertEqual(texts, [
-            'Плановое отключение электричества!\n'
+            '<b>⚡ Плановое отключение электричества!</b>\n'
             '05.10.2026 11:00 — 05.10.2026 17:00 МСК\n'
             'Адрес: пос.Пески, Выборгский район\n'
             'Комментарий: Плановые работы на линии электропередач\n'
             'Запись: 1\n'
             'Проверка: 02.10.2026 09:00 МСК\n'
             '\nИсточник: ' + config.source,
-            'Плановое отключение электричества!\n'
+            '<b>⚡ Плановое отключение электричества!</b>\n'
             '06.10.2026 09:00 — 06.10.2026 12:00 МСК\n'
             'Адрес: п Пески, ул Пихтовая; п Пески, ул Благодатная, Выборгский район\n'
             'Комментарий: не указан\n'
@@ -94,6 +94,16 @@ class Tests(unittest.TestCase):
             'Проверка: 02.10.2026 09:00 МСК\n'
             '\nИсточник: ' + config.source,
         ])
+
+    def test_messages_escapes_html_in_comment_and_address(self):
+        config = m.Config()
+        now = datetime(2026, 10, 2, 9, 0, tzinfo=m.MSK)
+        row = m.Outage('1', 'п Пески, ул <Центр> & Co', datetime(2026, 10, 5, tzinfo=m.MSK),
+                        datetime(2026, 10, 5, 12, tzinfo=m.MSK), 'Авария <важно> & срочно')
+        text = m.messages([row], now, config)[0]
+        self.assertIn('Адрес: п Пески, ул &lt;Центр&gt; &amp; Co, Выборгский район', text)
+        self.assertIn('Комментарий: Авария &lt;важно&gt; &amp; срочно', text)
+        self.assertNotIn('<важно>', text)
 
     def test_address_line_falls_back_for_bare_settlement_mentions(self):
         config = m.Config()
