@@ -65,6 +65,7 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || (!inputs.dry_run && !inputs.test_message && !inputs.sample_message)
         run: python monitor.py
         env:
+          SCHEDULE_CRON: ${{ github.event.schedule }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_ERROR_CHAT_ID: ${{ secrets.TELEGRAM_ERROR_CHAT_ID }}
@@ -73,13 +74,14 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
-      - name: Save sent-notifications state
+      - name: Save state and run log
         if: always() && (github.event_name != 'workflow_dispatch' || (!inputs.dry_run && !inputs.test_message && !inputs.sample_message))
         run: |
-          if ! git diff --quiet -- sent.json; then
+          git add sent.json runs.log
+          if ! git diff --cached --quiet; then
             git config user.name 'github-actions[bot]'
             git config user.email 'github-actions[bot]@users.noreply.github.com'
-            git add sent.json
-            git commit -m 'Update sent-notifications state'
+            git commit -m 'Update state and run log'
+            git pull --rebase -q origin main
             git push
           fi

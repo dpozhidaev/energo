@@ -8,7 +8,7 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 from pathlib import Path
 import re
@@ -26,6 +26,8 @@ CA = Path(__file__).parent / 'certs/russian_trusted_root_ca.pem'
 MSK = ZoneInfo('Europe/Moscow')
 DEFAULT_CONFIG = Path(__file__).parent / 'config.json'
 DEFAULT_SENT_STATE = Path(__file__).parent / 'sent.json'
+DEFAULT_RUN_LOG = Path(__file__).parent / 'runs.log'
+RUN_LOG_RETENTION = timedelta(days=90)
 # Облачные раннеры GitHub Actions размещены за пределами РФ; сайт закрыт DDoS-Guard geoblock'ом
 # ("the website owner has restricted access from your current IP address") для таких адресов.
 # Список ниже обновляется автоматически (раз в ~30 минут) и включает геолокацию и протокол каждого узла.
@@ -340,7 +342,7 @@ def collect(session, now, config=Config()):
     return sorted(result.values(), key=lambda r: (r.start, r.record_id))
 
 
-SENT_STATE_LIMIT = 10
+SENT_STATE_LIMIT = 100
 
 
 def load_sent_state(path=DEFAULT_SENT_STATE):
@@ -460,9 +462,47 @@ def notify_owner(text, config=Config()):
 RUN_SOURCES = {'schedule': 'по расписанию', 'workflow_dispatch': 'вручную из Actions'}
 
 
-def run_stamp(now):
+def run_source():
+    """Что запустило проверку; для расписания добавляется сработавший cron (SCHEDULE_CRON из workflow)."""
     source = RUN_SOURCES.get(os.environ.get('GITHUB_EVENT_NAME', ''), 'локально')
-    return f'Запуск: {now:%d.%m.%Y %H:%M} МСК ({source})'
+    cron = os.environ.get('SCHEDULE_CRON', '').strip()
+    return f'{source}, cron {cron}' if cron else source
+
+
+def run_stamp(now):
+    return f'Запуск: {now:%d.%m.%Y %H:%M} МСК ({run_source()})'
+
+
+def run_log_line(now, outcome):
+    outcome = ' '.join(outcome.split())[:200]
+    return f'{now:%Y-%m-%d %H:%M} МСК | {run_source()} | {outcome}'
+
+
+def append_run_log(line, now, path=DEFAULT_RUN_LOG):
+    """Добавляет строку в журнал запусков и убирает записи старше RUN_LOG_RETENTION (3 месяца)."""
+    try:
+        old = Path(path).read_text(encoding='utf-8').splitlines()
+    except FileNotFoundError:
+        old = []
+    kept = []
+    for entry in old:
+        try:
+            when = datetime.strptime(entry[:16], '%Y-%m-%d %H:%M').replace(tzinfo=MSK)
+        except ValueError:
+            kept.append(entry)
+            continue
+        if now - when <= RUN_LOG_RETENTION:
+            kept.append(entry)
+    kept.append(line)
+    Path(path).write_text('\n'.join(kept) + '\n', encoding='utf-8')
+
+
+def record_run(now, outcome):
+    # Журнал вторичен: сбой записи не должен ронять уже выполненную проверку.
+    try:
+        append_run_log(run_log_line(now, outcome), now)
+    except OSError:
+        print('Не удалось записать журнал запусков', file=sys.stderr)
 
 
 def error_code(exc):
@@ -523,6 +563,7 @@ def main():
         if not args.dry_run:
             validate_destination(config)
         now = datetime.now(MSK)
+        print(run_stamp(now))
         with site_session() as session:
             rows = collect_with_fallback(session, now, config)
         sent = load_sent_state()
@@ -536,6 +577,7 @@ def main():
                 send(text, config, parse_mode='HTML')
         if not args.dry_run:
             save_sent_state(update_sent_state(sent, new_rows))
+            record_run(now, f'OK: актуальных {len(rows)}, новых {len(new_rows)}')
             try:
                 notify_owner(run_report(now, len(rows), len(new_rows), config), config)
             except Exception:
@@ -545,8 +587,10 @@ def main():
     except Exception as exc:
         print(f'Ошибка {error_code(exc)}: {type(exc).__name__}: {exc}', file=sys.stderr)
         if config is not None and not args.dry_run and not args.chat_id and not args.test_message and not args.sample_message and not args.write_schedules:
+            failed_at = datetime.now(MSK)
+            record_run(failed_at, f'ОШИБКА {error_code(exc)}: {type(exc).__name__}: {exc}')
             try:
-                notify_owner(error_report(exc, datetime.now(MSK), config), config)
+                notify_owner(error_report(exc, failed_at, config), config)
             except Exception:
                 print('Не удалось отправить уведомление об ошибке', file=sys.stderr)
         return 1

@@ -365,6 +365,47 @@ class Tests(unittest.TestCase):
         self.assertIn('Детали: ProxiesFailedError: Ни один из 5 прокси не отдал страницы сайта', lines)
         self.assertEqual(lines[-1], 'Причина: ReadTimeout')
 
+    def test_run_stamp_includes_fired_cron(self):
+        now = datetime(2026, 10, 3, 17, 45, tzinfo=m.MSK)
+        env = {'GITHUB_EVENT_NAME': 'schedule', 'SCHEDULE_CRON': '45 17 * * *'}
+        with patch.dict(m.os.environ, env, clear=True):
+            self.assertEqual(m.run_stamp(now), 'Запуск: 03.10.2026 17:45 МСК (по расписанию, cron 45 17 * * *)')
+            self.assertIn('Запуск: 03.10.2026 17:45 МСК (по расписанию, cron 45 17 * * *)',
+                          m.run_report(now, 0, 0, m.Config()))
+        with patch.dict(m.os.environ, {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'SCHEDULE_CRON': ''}, clear=True):
+            self.assertEqual(m.run_stamp(now), 'Запуск: 03.10.2026 17:45 МСК (вручную из Actions)')
+
+    def test_run_log_line_is_single_line_and_bounded(self):
+        now = datetime(2026, 10, 3, 17, 45, tzinfo=m.MSK)
+        with patch.dict(m.os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'SCHEDULE_CRON': '45 17 * * *'}, clear=True):
+            self.assertEqual(m.run_log_line(now, 'OK: актуальных 0, новых 0'),
+                             '2026-10-03 17:45 МСК | по расписанию, cron 45 17 * * * | OK: актуальных 0, новых 0')
+            line = m.run_log_line(now, 'ОШИБКА E02:\nпервая\nвторая ' + 'x' * 500)
+        self.assertNotIn('\n', line)
+        self.assertLessEqual(len(line.split(' | ')[2]), 200)
+
+    def test_append_run_log_drops_entries_older_than_three_months(self):
+        now = datetime(2026, 10, 3, 17, 45, tzinfo=m.MSK)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'runs.log'
+            path.write_text('2026-06-01 09:00 МСК | старая\n'          # > 90 дней назад
+                            '2026-07-10 09:00 МСК | ещё в пределах\n'   # ~85 дней
+                            'строка не по формату\n', encoding='utf-8')
+            m.append_run_log('2026-10-03 17:45 МСК | новая', now, path)
+            self.assertEqual(path.read_text(encoding='utf-8').splitlines(),
+                             ['2026-07-10 09:00 МСК | ещё в пределах', 'строка не по формату',
+                              '2026-10-03 17:45 МСК | новая'])
+            missing = Path(tmp) / 'new.log'
+            m.append_run_log('2026-10-03 17:45 МСК | первая', now, missing)
+            self.assertEqual(missing.read_text(encoding='utf-8'), '2026-10-03 17:45 МСК | первая\n')
+
+    def test_sent_state_keeps_last_hundred_by_default(self):
+        rows = [m.Outage(str(i), 'a', datetime(2026, 10, 5, tzinfo=m.MSK), datetime(2026, 10, 5, 12, tzinfo=m.MSK), '')
+                for i in range(150)]
+        state = m.update_sent_state([], rows)
+        self.assertEqual(len(state), 100)
+        self.assertEqual((state[0], state[-1]), ('50', '149'))
+
     @patch.object(m, 'send')
     def test_notify_owner_for_email_uses_regular_destination(self, send):
         config = m.Config(channel='email', email_to='owner@example.org')
