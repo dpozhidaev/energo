@@ -201,7 +201,7 @@ def parse_page(html, config=Config()):
 
 # Соединение / ожидание ответа, секунд: не отвечает за это время — идём дальше (другой прокси).
 REQUEST_TIMEOUT = (10, 20)
-MAX_PROXY_ATTEMPTS = 5
+MAX_PROXY_ATTEMPTS = 20
 
 
 def site_session():
