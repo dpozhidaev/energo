@@ -31,12 +31,12 @@ class ConfigTests(unittest.TestCase):
         root = Path(m.__file__).parent
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
-            for name in ['.github/workflows/check.yml', 'deploy/peski-monitor.timer']:
+            for name in ['.github/workflows/outage-check.yml', 'deploy/peski-monitor.timer']:
                 dest = out / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text((root / name).read_text())
             m.write_schedules(m.Config(check_time='01:05', backup_check_time='17:45'), out)
-            workflow = (out / '.github/workflows/check.yml').read_text()
+            workflow = (out / '.github/workflows/outage-check.yml').read_text()
             self.assertIn("cron: '5 1 * * *'", workflow)
             self.assertIn("cron: '45 17 * * *'", workflow)
             self.assertEqual(workflow.count('timezone: "Europe/Moscow"'), 2)
@@ -45,13 +45,13 @@ class ConfigTests(unittest.TestCase):
             self.assertIn('OnCalendar=*-*-* 01:05:00 Europe/Moscow', timer)
             self.assertIn('OnCalendar=*-*-* 17:45:00 Europe/Moscow', timer)
             m.write_schedules(m.Config(check_time='08:30'), out)
-            self.assertEqual((out / '.github/workflows/check.yml').read_text().count('cron:'), 1)
+            self.assertEqual((out / '.github/workflows/outage-check.yml').read_text().count('cron:'), 1)
             self.assertEqual((out / 'deploy/peski-monitor.timer').read_text().count('OnCalendar='), 1)
 
     def test_committed_schedules_match_config(self):
         c = m.load_config()
         root = Path(m.__file__).parent
-        workflow = (root / '.github/workflows/check.yml').read_text()
+        workflow = (root / '.github/workflows/outage-check.yml').read_text()
         timer = (root / 'deploy/peski-monitor.timer').read_text()
         self.assertEqual(workflow.count('cron:'), len(c.check_times), 'Run python monitor.py --write-schedules')
         self.assertEqual(workflow.count('timezone: "Europe/Moscow"'), len(c.check_times))

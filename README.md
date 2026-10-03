@@ -34,7 +34,7 @@ ID Telegram нельзя определить по почте; получите 
 .venv/bin/python monitor.py --write-schedules
 ```
 
-Команда обновляет `.github/workflows/check.yml` (cron с `timezone: "Europe/Moscow"`, то есть время в файле московское, без пересчёта в UTC) и `deploy/peski-monitor.timer`. Закоммитьте их вместе с `config.json`. **GitHub читает расписание из YAML: изменение только JSON не меняет время запуска.** Тест обнаруживает расхождение. На VM скопируйте обновленный timer, выполните `sudo systemctl daemon-reload` и `sudo systemctl restart peski-monitor.timer`.
+Команда обновляет `.github/workflows/outage-check.yml` (cron с `timezone: "Europe/Moscow"`, то есть время в файле московское, без пересчёта в UTC) и `deploy/peski-monitor.timer`. Закоммитьте их вместе с `config.json`. **GitHub читает расписание из YAML: изменение только JSON не меняет время запуска.** Тест обнаруживает расхождение. На VM скопируйте обновленный timer, выполните `sudo systemctl daemon-reload` и `sudo systemctl restart peski-monitor.timer`.
 
 `python monitor.py` делает одну проверку сразу; расписание обеспечивает Actions или systemd. Свой файл можно передать через `--config /path/to/config.json`.
 

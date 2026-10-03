@@ -130,7 +130,7 @@ def load_config(path=DEFAULT_CONFIG):
 def write_schedules(config, root=None):
     """Пишет расписание в Actions и systemd из check_time/backup_check_time (время Москвы)."""
     root = Path(root) if root else Path(__file__).parent
-    workflow = root / '.github/workflows/check.yml'
+    workflow = root / '.github/workflows/outage-check.yml'
     entries = ''.join(f"    - cron: '{int(t[3:])} {int(t[:2])} * * *' # {t} Europe/Moscow\n"
                       f'      timezone: "Europe/Moscow"\n' for t in config.check_times)
     text, count = re.subn(r'(?m)^  schedule:\n(?:^    .*\n)+', '  schedule:\n' + entries, workflow.read_text())
