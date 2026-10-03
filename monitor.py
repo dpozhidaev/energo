@@ -33,6 +33,46 @@ MONOSANS_PROXY_LIST_URL = 'https://raw.githubusercontent.com/monosans/proxy-list
 PROXYSCRAPE_URL = 'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=RU&anonymity=all'
 GEONODE_URL = 'https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&country=RU&protocols=http%2Chttps'
 
+# Коды ошибок для сообщения владельцу. Базовые классы сохранены (ValueError/RuntimeError),
+# чтобы существующие except и тесты не менялись.
+ERROR_TITLES = {
+    'E01': 'нет рабочего прокси в РФ (сайт закрыт напрямую)',
+    'E02': 'прокси найдены, но ни один не отдал страницы сайта',
+    'E03': 'страница сайта в неожиданном виде (сменилась разметка или заглушка вместо таблицы)',
+    'E04': 'не удалось отправить сообщение в Telegram (токен, chat_id или сеть)',
+    'E05': 'не удалось отправить email (настройки SMTP)',
+    'E06': 'ошибка настроек (config.json или не заданы токен/chat_id)',
+    'E99': 'неизвестная ошибка',
+}
+
+
+class MonitorError(Exception):
+    code = 'E99'
+
+
+class NoProxyError(MonitorError, RuntimeError):
+    code = 'E01'
+
+
+class ProxiesFailedError(MonitorError, RuntimeError):
+    code = 'E02'
+
+
+class SiteStructureError(MonitorError, ValueError):
+    code = 'E03'
+
+
+class TelegramError(MonitorError, RuntimeError):
+    code = 'E04'
+
+
+class EmailError(MonitorError, RuntimeError):
+    code = 'E05'
+
+
+class ConfigError(MonitorError, ValueError):
+    code = 'E06'
+
 
 @dataclass(frozen=True)
 class Config:
@@ -47,13 +87,13 @@ class Config:
 
     def __post_init__(self):
         if not all(isinstance(v, str) for v in self.__dict__.values()):
-            raise ValueError('Все параметры config.json должны быть строками')
+            raise ConfigError('Все параметры config.json должны быть строками')
         if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', self.check_time):
-            raise ValueError('check_time должен иметь формат HH:MM, время Москвы')
+            raise ConfigError('check_time должен иметь формат HH:MM, время Москвы')
         if self.channel not in ('telegram', 'email'):
-            raise ValueError('channel должен быть telegram или email')
+            raise ConfigError('channel должен быть telegram или email')
         if not self.settlement.strip() or not self.district.strip():
-            raise ValueError('settlement и district не могут быть пустыми')
+            raise ConfigError('settlement и district не могут быть пустыми')
 
     @property
     def params(self):
@@ -108,18 +148,18 @@ def parse_page(html, config=Config()):
     soup = BeautifulSoup(html, 'html.parser')
     table = soup.select_one('table.tableous_facts')
     if table is None:
-        raise ValueError('Таблица отключений не найдена: возможно, сайт изменился или недоступен')
+        raise SiteStructureError('Таблица отключений не найдена: возможно, сайт изменился или недоступен')
     headers = clean(table.get_text(' ', strip=True)).lower()
     for required in ('адрес', 'плановое время начала', 'плановое время восстановления'):
         if required not in headers:
-            raise ValueError('Изменилась структура таблицы отключений')
+            raise SiteStructureError('Изменилась структура таблицы отключений')
     outages, ids = [], []
     for row in table.select('tbody tr'):
         cells = row.find_all('td', recursive=False)
         if not cells:
             continue
         if len(cells) != 11 or not row.get('data-record-id'):
-            raise ValueError('Неожиданная строка в таблице; результат не считается пустым')
+            raise SiteStructureError('Неожиданная строка в таблице; результат не считается пустым')
         vals = [clean(c.get_text(' ', strip=True)) for c in cells]
         ids.append(row['data-record-id'])
         # Проверяем район и населённый пункт, а не произвольное упоминание в комментарии.
@@ -132,7 +172,7 @@ def parse_page(html, config=Config()):
         start = datetime.strptime(vals[3] + ' ' + vals[4], '%d-%m-%Y %H:%M').replace(tzinfo=MSK)
         end = datetime.strptime(vals[5] + ' ' + vals[6], '%d-%m-%Y %H:%M').replace(tzinfo=MSK)
         if end < start:
-            raise ValueError('Время окончания отключения раньше начала')
+            raise SiteStructureError('Время окончания отключения раньше начала')
         # Только строки адреса, где встречается сам посёлок — остальные посёлки общей записи не нужны.
         outages.append(Outage(row['data-record-id'], '; '.join(matches), start, end, vals[9]))
     pages = {1}
@@ -145,7 +185,7 @@ def parse_page(html, config=Config()):
             if value.isdigit() and int(value) > 0:
                 pages.add(int(value))
     if max(pages) > 100:
-        raise ValueError('Слишком много страниц; требуется проверка сайта')
+        raise SiteStructureError('Слишком много страниц; требуется проверка сайта')
     return outages, set(range(1, max(pages) + 1)), tuple(ids)
 
 
@@ -231,7 +271,7 @@ def iter_working_proxies(session, config=Config(), limit=80, max_workers=20):
     """Отдаёт рабочие российские прокси из открытых списков по мере проверки (параллельно)."""
     candidates = fetch_candidate_proxies(session)[:limit]
     if not candidates:
-        raise RuntimeError('Не удалось получить список прокси для РФ')
+        raise NoProxyError('Не удалось получить список прокси для РФ')
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     try:
         futures = [pool.submit(probe_proxy, scheme, address, config) for scheme, address in candidates]
@@ -266,8 +306,8 @@ def collect_with_fallback(session, now, config=Config()):
             if attempts >= MAX_PROXY_ATTEMPTS:
                 break
     if attempts == 0:
-        raise RuntimeError('Не найден работающий прокси в РФ')
-    raise RuntimeError(f'Ни один из {attempts} прокси не отдал страницы сайта') from last_error
+        raise NoProxyError('Не найден работающий прокси в РФ')
+    raise ProxiesFailedError(f'Ни один из {attempts} прокси не отдал страницы сайта') from last_error
 
 
 def collect(session, now, config=Config()):
@@ -281,7 +321,7 @@ def collect(session, now, config=Config()):
         response.encoding = 'utf-8'
         rows, pages, signature = parse_page(response.text, config)
         if signature and signature in signatures:
-            raise ValueError('Сайт повторяет страницу вместо перехода к следующей')
+            raise SiteStructureError('Сайт повторяет страницу вместо перехода к следующей')
         signatures.add(signature)
         visited.add(page)
         pending.update(pages - visited)
@@ -349,7 +389,7 @@ def messages(rows, now, config=Config()):
 def telegram(method, payload):
     token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
     if not token:
-        raise ValueError('Не задан TELEGRAM_BOT_TOKEN')
+        raise ConfigError('Не задан TELEGRAM_BOT_TOKEN')
     try:
         response = requests.post(f'https://api.telegram.org/bot{token}/{method}', json=payload, timeout=(10, 30))
         response.raise_for_status()
@@ -359,15 +399,15 @@ def telegram(method, payload):
         return data['result']
     except (requests.RequestException, ValueError):
         # Исключение requests содержит URL с токеном — не выводим его в журналы.
-        raise RuntimeError('Запрос к Telegram не выполнен; проверьте токен, chat_id и доступ к сети') from None
+        raise TelegramError('Запрос к Telegram не выполнен; проверьте токен, chat_id и доступ к сети') from None
 
 
 def validate_destination(config):
     if config.channel == 'telegram':
         if not os.environ.get('TELEGRAM_BOT_TOKEN') or not (os.environ.get('TELEGRAM_CHAT_ID') or config.telegram_chat_id):
-            raise ValueError('Задайте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID (или telegram_chat_id в config.json)')
+            raise ConfigError('Задайте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID (или telegram_chat_id в config.json)')
     elif not all(os.environ.get(k) for k in ('SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD')) or not config.email_to:
-        raise ValueError('Для email нужны SMTP_HOST, SMTP_USER, SMTP_PASSWORD и email_to')
+        raise ConfigError('Для email нужны SMTP_HOST, SMTP_USER, SMTP_PASSWORD и email_to')
 
 
 def send(text, config=Config(), parse_mode=None):
@@ -391,7 +431,7 @@ def send(text, config=Config(), parse_mode=None):
             smtp.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
             smtp.send_message(message)
     except (OSError, smtplib.SMTPException):
-        raise RuntimeError('Не удалось отправить email: проверьте настройки SMTP') from None
+        raise EmailError('Не удалось отправить email: проверьте настройки SMTP') from None
 
 
 def notify_owner(text, config=Config()):
@@ -415,6 +455,21 @@ RUN_SOURCES = {'schedule': 'по расписанию', 'workflow_dispatch': 'в
 def run_stamp(now):
     source = RUN_SOURCES.get(os.environ.get('GITHUB_EVENT_NAME', ''), 'локально')
     return f'Запуск: {now:%d.%m.%Y %H:%M} МСК ({source})'
+
+
+def error_code(exc):
+    return exc.code if isinstance(exc, MonitorError) else 'E99'
+
+
+def error_report(exc, now, config=Config()):
+    code = error_code(exc)
+    lines = [f'⚠️ Ошибка {code}: {ERROR_TITLES[code]}',
+             f'Не удалось проверить отключения: {config.label}. Отсутствие сводки не означает отсутствие отключений.',
+             run_stamp(now),
+             f'Детали: {type(exc).__name__}: {exc}']
+    if exc.__cause__ is not None:
+        lines.append(f'Причина: {type(exc.__cause__).__name__}')
+    return '\n'.join(lines)[:1000]
 
 
 def run_report(now, found, sent, config=Config()):
@@ -480,12 +535,10 @@ def main():
                 print('Не удалось отправить отчёт о запуске владельцу', file=sys.stderr)
         return 0
     except Exception as exc:
-        print(f'Ошибка: {type(exc).__name__}: {exc}', file=sys.stderr)
+        print(f'Ошибка {error_code(exc)}: {type(exc).__name__}: {exc}', file=sys.stderr)
         if config is not None and not args.dry_run and not args.chat_id and not args.test_message and not args.sample_message and not args.write_schedules:
             try:
-                notify_owner(f'⚠️ Не удалось проверить отключения: {config.label}. Отсутствие сводки не означает '
-                             f'отсутствие отключений.\n{run_stamp(datetime.now(MSK))}\n'
-                             f'Ошибка: {type(exc).__name__}: {exc}'[:1000], config)
+                notify_owner(error_report(exc, datetime.now(MSK), config), config)
             except Exception:
                 print('Не удалось отправить уведомление об ошибке', file=sys.stderr)
         return 1

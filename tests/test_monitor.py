@@ -322,6 +322,49 @@ class Tests(unittest.TestCase):
         with patch.dict(m.os.environ, {}, clear=True):
             self.assertIn('(локально)', m.run_stamp(now))
 
+    def test_error_codes_per_failure_type(self):
+        cases = [(m.NoProxyError('x'), 'E01'), (m.ProxiesFailedError('x'), 'E02'),
+                 (m.SiteStructureError('x'), 'E03'), (m.TelegramError('x'), 'E04'),
+                 (m.EmailError('x'), 'E05'), (m.ConfigError('x'), 'E06'), (KeyError('x'), 'E99')]
+        for exc, code in cases:
+            self.assertEqual(m.error_code(exc), code)
+        self.assertEqual(set(m.ERROR_TITLES), {c for _, c in cases})
+
+    def test_raised_errors_carry_codes(self):
+        with self.assertRaises(m.SiteStructureError):
+            m.parse_page('<html>Service unavailable</html>')
+        with self.assertRaises(m.ConfigError):
+            m.Config(channel='sms')
+        with patch.object(m, 'fetch_candidate_proxies', return_value=[]):
+            with self.assertRaises(m.NoProxyError):
+                list(m.iter_working_proxies(Mock()))
+        with patch.dict(m.os.environ, {}, clear=True):
+            with self.assertRaises(m.ConfigError):
+                m.telegram('getMe', {})
+
+    @patch.object(m.requests, 'post', side_effect=requests.exceptions.ConnectionError('boom'))
+    def test_telegram_failure_is_coded_and_hides_token(self, post):
+        with patch.dict(m.os.environ, {'TELEGRAM_BOT_TOKEN': 'secret-token'}, clear=True):
+            with self.assertRaises(m.TelegramError) as ctx:
+                m.telegram('sendMessage', {})
+        self.assertNotIn('secret-token', str(ctx.exception))
+
+    def test_error_report_has_code_title_time_and_cause(self):
+        now = datetime(2026, 10, 3, 10, 15, tzinfo=m.MSK)
+        try:
+            try:
+                raise requests.exceptions.ReadTimeout('slow')
+            except requests.exceptions.ReadTimeout as cause:
+                raise m.ProxiesFailedError('Ни один из 5 прокси не отдал страницы сайта') from cause
+        except m.ProxiesFailedError as exc:
+            with patch.dict(m.os.environ, {'GITHUB_EVENT_NAME': 'schedule'}, clear=True):
+                text = m.error_report(exc, now, m.Config())
+        lines = text.split('\n')
+        self.assertEqual(lines[0], '⚠️ Ошибка E02: ' + m.ERROR_TITLES['E02'])
+        self.assertIn('Запуск: 03.10.2026 10:15 МСК (по расписанию)', lines)
+        self.assertIn('Детали: ProxiesFailedError: Ни один из 5 прокси не отдал страницы сайта', lines)
+        self.assertEqual(lines[-1], 'Причина: ReadTimeout')
+
     @patch.object(m, 'send')
     def test_notify_owner_for_email_uses_regular_destination(self, send):
         config = m.Config(channel='email', email_to='owner@example.org')
