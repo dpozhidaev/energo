@@ -394,19 +394,32 @@ def send(text, config=Config(), parse_mode=None):
         raise RuntimeError('Не удалось отправить email: проверьте настройки SMTP') from None
 
 
-def send_error(text, config=Config()):
-    """Сообщения об ошибках — только владельцу, не в общий канал с подписчиками.
+def notify_owner(text, config=Config()):
+    """Служебные сообщения (ошибки, отчёты о запусках) — только владельцу, не в общий канал.
 
-    Для Telegram получатель — TELEGRAM_ERROR_CHAT_ID; если не задан, ошибка остаётся
+    Для Telegram получатель — TELEGRAM_ERROR_CHAT_ID; если не задан, сообщение остаётся
     только в журнале запуска. Для email уходит на тот же адрес, что и обычные письма."""
     if config.channel != 'telegram':
         send(text, config)
         return
     chat = os.environ.get('TELEGRAM_ERROR_CHAT_ID', '').strip()
     if not chat:
-        print('TELEGRAM_ERROR_CHAT_ID не задан: уведомление об ошибке не отправлено', file=sys.stderr)
+        print('TELEGRAM_ERROR_CHAT_ID не задан: служебное сообщение не отправлено', file=sys.stderr)
         return
     telegram('sendMessage', dict(chat_id=chat, text=text, link_preview_options={'is_disabled': True}))
+
+
+RUN_SOURCES = {'schedule': 'по расписанию', 'workflow_dispatch': 'вручную из Actions'}
+
+
+def run_stamp(now):
+    source = RUN_SOURCES.get(os.environ.get('GITHUB_EVENT_NAME', ''), 'локально')
+    return f'Запуск: {now:%d.%m.%Y %H:%M} МСК ({source})'
+
+
+def run_report(now, found, sent, config=Config()):
+    return (f'✅ Проверка выполнена: {config.label}\n{run_stamp(now)}\n'
+            f'Актуальных записей: {found}, отправлено новых: {sent}')
 
 
 def main():
@@ -433,7 +446,7 @@ def main():
         if args.test_message:
             send(f'✅ Уведомления об отключениях: {config.label}.', config)
             if config.channel == 'telegram':
-                send_error('✅ Канал уведомлений об ошибках настроен.', config)
+                notify_owner('✅ Канал уведомлений об ошибках настроен.', config)
             return 0
         if args.sample_message:
             now = datetime.now(MSK)
@@ -460,13 +473,19 @@ def main():
                 send(text, config, parse_mode='HTML')
         if not args.dry_run:
             save_sent_state(update_sent_state(sent, new_rows))
+            try:
+                notify_owner(run_report(now, len(rows), len(new_rows), config), config)
+            except Exception:
+                # Проверка и рассылка уже выполнены: сбой отчёта владельцу не должен делать запуск «упавшим».
+                print('Не удалось отправить отчёт о запуске владельцу', file=sys.stderr)
         return 0
     except Exception as exc:
         print(f'Ошибка: {type(exc).__name__}: {exc}', file=sys.stderr)
         if config is not None and not args.dry_run and not args.chat_id and not args.test_message and not args.sample_message and not args.write_schedules:
             try:
-                send_error(f'⚠️ Не удалось проверить отключения: {config.label}. Отсутствие сводки не означает '
-                           f'отсутствие отключений.\nОшибка: {type(exc).__name__}: {exc}'[:1000], config)
+                notify_owner(f'⚠️ Не удалось проверить отключения: {config.label}. Отсутствие сводки не означает '
+                             f'отсутствие отключений.\n{run_stamp(datetime.now(MSK))}\n'
+                             f'Ошибка: {type(exc).__name__}: {exc}'[:1000], config)
             except Exception:
                 print('Не удалось отправить уведомление об ошибке', file=sys.stderr)
         return 1

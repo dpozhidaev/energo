@@ -298,22 +298,34 @@ class Tests(unittest.TestCase):
     @patch.dict(m.os.environ, {'TELEGRAM_BOT_TOKEN': 'test', 'TELEGRAM_CHAT_ID': '@channel',
                                'TELEGRAM_ERROR_CHAT_ID': '555'}, clear=True)
     @patch.object(m, 'telegram')
-    def test_send_error_goes_only_to_error_chat(self, telegram):
-        m.send_error('boom', m.Config())
+    def test_notify_owner_goes_only_to_error_chat(self, telegram):
+        m.notify_owner('boom', m.Config())
         self.assertEqual(telegram.call_count, 1)
         self.assertEqual(telegram.call_args.args[1]['chat_id'], '555')
         self.assertNotIn('parse_mode', telegram.call_args.args[1])
 
     @patch.dict(m.os.environ, {'TELEGRAM_BOT_TOKEN': 'test', 'TELEGRAM_CHAT_ID': '@channel'}, clear=True)
     @patch.object(m, 'telegram')
-    def test_send_error_never_falls_back_to_the_channel(self, telegram):
-        m.send_error('boom', m.Config())
+    def test_notify_owner_never_falls_back_to_the_channel(self, telegram):
+        m.notify_owner('boom', m.Config())
         telegram.assert_not_called()
 
+    def test_run_report_shows_time_source_and_counts(self):
+        now = datetime(2026, 10, 3, 10, 15, tzinfo=m.MSK)
+        with patch.dict(m.os.environ, {'GITHUB_EVENT_NAME': 'schedule'}, clear=True):
+            self.assertEqual(m.run_report(now, 3, 1, m.Config()),
+                             '✅ Проверка выполнена: Пески, Выборгский район\n'
+                             'Запуск: 03.10.2026 10:15 МСК (по расписанию)\n'
+                             'Актуальных записей: 3, отправлено новых: 1')
+        with patch.dict(m.os.environ, {'GITHUB_EVENT_NAME': 'workflow_dispatch'}, clear=True):
+            self.assertIn('(вручную из Actions)', m.run_stamp(now))
+        with patch.dict(m.os.environ, {}, clear=True):
+            self.assertIn('(локально)', m.run_stamp(now))
+
     @patch.object(m, 'send')
-    def test_send_error_for_email_uses_regular_destination(self, send):
+    def test_notify_owner_for_email_uses_regular_destination(self, send):
         config = m.Config(channel='email', email_to='owner@example.org')
-        m.send_error('boom', config)
+        m.notify_owner('boom', config)
         send.assert_called_once_with('boom', config)
 
 
