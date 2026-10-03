@@ -199,11 +199,16 @@ class Tests(unittest.TestCase):
         session.get.side_effect = requests.exceptions.RequestException()
         self.assertEqual(m.fetch_candidate_proxies(session), [])
 
+    def test_socks_proxies_resolve_names_remotely(self):
+        with patch.object(m.requests, 'get', return_value=Mock(text='<table class="tableous_facts">')):
+            self.assertEqual(m.probe_proxy('socks4', '1.2.3.4:1080')['https'], 'socks4a://1.2.3.4:1080')
+            self.assertEqual(m.probe_proxy('http', '1.2.3.4:8080')['https'], 'http://1.2.3.4:8080')
+
     @patch.object(m.requests, 'get')
     def test_probe_proxy_checks_real_content(self, get):
         get.return_value = Mock(text='<table class="tableous_facts">...</table>')
         self.assertEqual(m.probe_proxy('socks5', '1.2.3.4:1080'),
-                          {'http': 'socks5://1.2.3.4:1080', 'https': 'socks5://1.2.3.4:1080'})
+                          {'http': 'socks5h://1.2.3.4:1080', 'https': 'socks5h://1.2.3.4:1080'})
         get.return_value = Mock(text='<html>blocked</html>')
         self.assertIsNone(m.probe_proxy('socks5', '1.2.3.4:1080'))
         get.side_effect = requests.exceptions.ConnectTimeout()
@@ -211,32 +216,67 @@ class Tests(unittest.TestCase):
 
     @patch.object(m, 'probe_proxy')
     @patch.object(m, 'fetch_candidate_proxies')
-    def test_find_working_proxy_returns_first_success(self, fetch_candidates, probe_proxy):
+    def test_iter_working_proxies_yields_only_working_ones(self, fetch_candidates, probe_proxy):
         fetch_candidates.return_value = [('http', '1.1.1.1:80'), ('socks5', '2.2.2.2:1080')]
         probe_proxy.side_effect = lambda scheme, address, config=m.Config(): (
             {'http': f'{scheme}://{address}', 'https': f'{scheme}://{address}'} if address == '2.2.2.2:1080' else None)
-        self.assertEqual(m.find_working_proxy(Mock())['https'], 'socks5://2.2.2.2:1080')
+        found = list(m.iter_working_proxies(Mock()))
+        self.assertEqual([p['https'] for p in found], ['socks5://2.2.2.2:1080'])
 
     @patch.object(m, 'probe_proxy', return_value=None)
     @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', '1.1.1.1:80')])
-    def test_find_working_proxy_raises_without_any_match(self, fetch_candidates, probe_proxy):
-        with self.assertRaises(RuntimeError):
-            m.find_working_proxy(Mock())
+    def test_iter_working_proxies_empty_without_any_match(self, fetch_candidates, probe_proxy):
+        self.assertEqual(list(m.iter_working_proxies(Mock())), [])
 
     @patch.object(m, 'fetch_candidate_proxies', return_value=[])
-    def test_find_working_proxy_raises_without_candidates(self, fetch_candidates):
+    def test_iter_working_proxies_raises_without_candidates(self, fetch_candidates):
         with self.assertRaises(RuntimeError):
-            m.find_working_proxy(Mock())
+            list(m.iter_working_proxies(Mock()))
 
-    @patch.object(m, 'find_working_proxy')
-    def test_collect_with_fallback_switches_to_proxy_on_direct_failure(self, find_working_proxy):
-        find_working_proxy.return_value = {'http': 'http://1.2.3.4:8080', 'https': 'http://1.2.3.4:8080'}
+    @patch.object(m, 'iter_working_proxies')
+    def test_collect_with_fallback_switches_to_proxy_on_direct_failure(self, iter_proxies):
+        proxy = {'http': 'http://1.2.3.4:8080', 'https': 'http://1.2.3.4:8080'}
+        iter_proxies.return_value = iter([proxy])
         session = Mock()
         session.proxies = {}
         session.get.side_effect = [requests.exceptions.ConnectionError(), Mock(text=page())]
         rows = m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
         self.assertEqual(len(rows), 1)
-        self.assertEqual(session.proxies, find_working_proxy.return_value)
+        self.assertEqual(session.proxies, proxy)
+
+    @patch.object(m, 'iter_working_proxies')
+    def test_collect_with_fallback_moves_on_when_proxy_times_out(self, iter_proxies):
+        slow = {'http': 'socks5://1.1.1.1:1080', 'https': 'socks5://1.1.1.1:1080'}
+        good = {'http': 'socks5://2.2.2.2:1080', 'https': 'socks5://2.2.2.2:1080'}
+        iter_proxies.return_value = iter([slow, good])
+        session = Mock()
+        session.proxies = {}
+        session.get.side_effect = [requests.exceptions.ConnectionError(),   # напрямую
+                                   requests.exceptions.ReadTimeout(),       # первый прокси завис
+                                   Mock(text=page())]                       # второй отдал страницу
+        rows = m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(session.proxies, good)
+
+    @patch.object(m, 'iter_working_proxies')
+    def test_collect_with_fallback_gives_up_after_max_attempts(self, iter_proxies):
+        proxies = [{'http': f'socks5://10.0.0.{i}:1080', 'https': f'socks5://10.0.0.{i}:1080'}
+                   for i in range(m.MAX_PROXY_ATTEMPTS + 3)]
+        iter_proxies.return_value = iter(proxies)
+        session = Mock()
+        session.proxies = {}
+        session.get.side_effect = requests.exceptions.ReadTimeout()
+        with self.assertRaises(RuntimeError):
+            m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
+        self.assertEqual(session.get.call_count, 1 + m.MAX_PROXY_ATTEMPTS)
+
+    @patch.object(m, 'iter_working_proxies', return_value=iter([]))
+    def test_collect_with_fallback_raises_when_no_proxy_found(self, iter_proxies):
+        session = Mock()
+        session.proxies = {}
+        session.get.side_effect = requests.exceptions.ConnectionError()
+        with self.assertRaises(RuntimeError):
+            m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
 
     def test_collect_with_fallback_skips_proxy_search_when_direct_works(self):
         session = Mock()
@@ -245,6 +285,36 @@ class Tests(unittest.TestCase):
         rows = m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
         self.assertEqual(len(rows), 1)
         self.assertEqual(session.proxies, {})
+
+    def test_requests_use_short_timeout_and_do_not_retry_hangs(self):
+        session = Mock()
+        session.get.return_value = Mock(text=page())
+        m.collect(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
+        self.assertEqual(session.get.call_args.kwargs['timeout'], m.REQUEST_TIMEOUT)
+        self.assertEqual(m.REQUEST_TIMEOUT[1], 20)
+        retries = m.site_session().get_adapter(m.BASE).max_retries
+        self.assertEqual((retries.connect, retries.read), (0, 0))
+
+    @patch.dict(m.os.environ, {'TELEGRAM_BOT_TOKEN': 'test', 'TELEGRAM_CHAT_ID': '@channel',
+                               'TELEGRAM_ERROR_CHAT_ID': '555'}, clear=True)
+    @patch.object(m, 'telegram')
+    def test_send_error_goes_only_to_error_chat(self, telegram):
+        m.send_error('boom', m.Config())
+        self.assertEqual(telegram.call_count, 1)
+        self.assertEqual(telegram.call_args.args[1]['chat_id'], '555')
+        self.assertNotIn('parse_mode', telegram.call_args.args[1])
+
+    @patch.dict(m.os.environ, {'TELEGRAM_BOT_TOKEN': 'test', 'TELEGRAM_CHAT_ID': '@channel'}, clear=True)
+    @patch.object(m, 'telegram')
+    def test_send_error_never_falls_back_to_the_channel(self, telegram):
+        m.send_error('boom', m.Config())
+        telegram.assert_not_called()
+
+    @patch.object(m, 'send')
+    def test_send_error_for_email_uses_regular_destination(self, send):
+        config = m.Config(channel='email', email_to='owner@example.org')
+        m.send_error('boom', config)
+        send.assert_called_once_with('boom', config)
 
 
 if __name__ == '__main__':

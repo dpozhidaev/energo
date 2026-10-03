@@ -149,15 +149,25 @@ def parse_page(html, config=Config()):
     return outages, set(range(1, max(pages) + 1)), tuple(ids)
 
 
+# Соединение / ожидание ответа, секунд: не отвечает за это время — идём дальше (другой прокси).
+REQUEST_TIMEOUT = (10, 20)
+MAX_PROXY_ATTEMPTS = 5
+
+
 def site_session():
     session = requests.Session()
     session.headers['User-Agent'] = 'PeskiOutageMonitor/1.0 (daily personal notification)'
-    retry = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=['GET'])
+    # Повторяем только ответы 429/5xx; зависание или обрыв не повторяем — это решает смена прокси.
+    retry = Retry(total=3, connect=0, read=0, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=['GET'])
     session.mount('https://', HTTPAdapter(max_retries=retry))
     return session
 
 
 SUPPORTED_PROXY_SCHEMES = ('http', 'socks4', 'socks5')
+# Для SOCKS имя сайта должно резолвиться на стороне прокси (socks5h/socks4a), а не локально: локальный
+# DNS может вернуть заглушку (VPN в режиме fake-ip, подмена), и прокси пойдёт не туда.
+REMOTE_DNS_SCHEME = {'socks4': 'socks4a', 'socks5': 'socks5h'}
 
 
 def fetch_candidate_proxies(session):
@@ -207,42 +217,57 @@ def fetch_candidate_proxies(session):
 
 def probe_proxy(scheme, address, config=Config()):
     """Проверяет, отдаёт ли прокси настоящую страницу отключений (а не блокировку/заглушку)."""
-    proxies = {'http': f'{scheme}://{address}', 'https': f'{scheme}://{address}'}
+    url_scheme = REMOTE_DNS_SCHEME.get(scheme, scheme)
+    proxies = {'http': f'{url_scheme}://{address}', 'https': f'{url_scheme}://{address}'}
     try:
-        response = requests.get(BASE, params=config.params, proxies=proxies, timeout=(6, 15), verify=str(CA))
+        response = requests.get(BASE, params=config.params, proxies=proxies, timeout=REQUEST_TIMEOUT, verify=str(CA))
         response.raise_for_status()
     except requests.RequestException:
         return None
     return proxies if 'tableous_facts' in response.text else None
 
 
-def find_working_proxy(session, config=Config(), limit=80, max_workers=20):
-    """Подбирает рабочий российский прокси из открытых списков, проверяя кандидатов параллельно."""
+def iter_working_proxies(session, config=Config(), limit=80, max_workers=20):
+    """Отдаёт рабочие российские прокси из открытых списков по мере проверки (параллельно)."""
     candidates = fetch_candidate_proxies(session)[:limit]
     if not candidates:
         raise RuntimeError('Не удалось получить список прокси для РФ')
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     try:
-        futures = {pool.submit(probe_proxy, scheme, address, config): (scheme, address) for scheme, address in candidates}
+        futures = [pool.submit(probe_proxy, scheme, address, config) for scheme, address in candidates]
         for future in concurrent.futures.as_completed(futures):
             proxies = future.result()
             if proxies:
-                return proxies
+                yield proxies
     finally:
-        # Не ждём медленные/зависшие проверки остальных кандидатов после первого успеха.
+        # Не ждём медленные/зависшие проверки остальных кандидатов, когда прокси уже выбран.
         pool.shutdown(wait=False, cancel_futures=True)
-    raise RuntimeError(f'Не найден работающий прокси в РФ среди {len(candidates)} адресов')
 
 
 def collect_with_fallback(session, now, config=Config()):
-    """Сначала пробует прямой доступ; при недоступности сайта подбирает рабочий прокси в РФ и повторяет."""
+    """Сначала пробует прямой доступ; при недоступности перебирает рабочие российские прокси.
+
+    Прокси, который прошёл проверку, но завис или оборвался на реальных страницах, пропускается:
+    берём следующий (не больше MAX_PROXY_ATTEMPTS)."""
     try:
         return collect(session, now, config)
     except (requests.RequestException, ValueError):
-        proxies = find_working_proxy(session, config)
+        pass
+    attempts, last_error = 0, None
+    for proxies in iter_working_proxies(session, config):
+        attempts += 1
         session.proxies.update(proxies)
-        print(f'Прямой доступ к сайту недоступен; используется прокси {proxies["https"]}')
-        return collect(session, now, config)
+        print(f'Прямой доступ к сайту недоступен; пробую прокси {proxies["https"]}')
+        try:
+            return collect(session, now, config)
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            print(f'Прокси {proxies["https"]} не сработал ({type(exc).__name__}), беру следующий')
+            if attempts >= MAX_PROXY_ATTEMPTS:
+                break
+    if attempts == 0:
+        raise RuntimeError('Не найден работающий прокси в РФ')
+    raise RuntimeError(f'Ни один из {attempts} прокси не отдал страницы сайта') from last_error
 
 
 def collect(session, now, config=Config()):
@@ -251,7 +276,7 @@ def collect(session, now, config=Config()):
         page = min(pending)
         pending.remove(page)
         # Ссылки сайта теряют фильтры: переносим только номер страницы.
-        response = session.get(BASE, params={**config.params, 'PAGEN_1': page}, timeout=(10, 45), verify=str(CA))
+        response = session.get(BASE, params={**config.params, 'PAGEN_1': page}, timeout=REQUEST_TIMEOUT, verify=str(CA))
         response.raise_for_status()
         response.encoding = 'utf-8'
         rows, pages, signature = parse_page(response.text, config)
@@ -369,6 +394,21 @@ def send(text, config=Config(), parse_mode=None):
         raise RuntimeError('Не удалось отправить email: проверьте настройки SMTP') from None
 
 
+def send_error(text, config=Config()):
+    """Сообщения об ошибках — только владельцу, не в общий канал с подписчиками.
+
+    Для Telegram получатель — TELEGRAM_ERROR_CHAT_ID; если не задан, ошибка остаётся
+    только в журнале запуска. Для email уходит на тот же адрес, что и обычные письма."""
+    if config.channel != 'telegram':
+        send(text, config)
+        return
+    chat = os.environ.get('TELEGRAM_ERROR_CHAT_ID', '').strip()
+    if not chat:
+        print('TELEGRAM_ERROR_CHAT_ID не задан: уведомление об ошибке не отправлено', file=sys.stderr)
+        return
+    telegram('sendMessage', dict(chat_id=chat, text=text, link_preview_options={'is_disabled': True}))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG, help='Файл настроек JSON')
@@ -392,6 +432,8 @@ def main():
             return 0
         if args.test_message:
             send(f'✅ Уведомления об отключениях: {config.label}.', config)
+            if config.channel == 'telegram':
+                send_error('✅ Канал уведомлений об ошибках настроен.', config)
             return 0
         if args.sample_message:
             now = datetime.now(MSK)
@@ -423,7 +465,8 @@ def main():
         print(f'Ошибка: {type(exc).__name__}: {exc}', file=sys.stderr)
         if config is not None and not args.dry_run and not args.chat_id and not args.test_message and not args.sample_message and not args.write_schedules:
             try:
-                send(f'⚠️ Не удалось проверить отключения: {config.label}. Отсутствие сводки не означает отсутствие отключений. Проверьте журнал запуска.', config)
+                send_error(f'⚠️ Не удалось проверить отключения: {config.label}. Отсутствие сводки не означает '
+                           f'отсутствие отключений.\nОшибка: {type(exc).__name__}: {exc}'[:1000], config)
             except Exception:
                 print('Не удалось отправить уведомление об ошибке', file=sys.stderr)
         return 1
