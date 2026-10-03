@@ -1,7 +1,7 @@
 name: Peski daily outage check
 on:
   schedule:
-    - cron: '15 7 * * *' # 10:15 Europe/Moscow
+    - cron: '55 9 * * *' # 12:55 Europe/Moscow
   workflow_dispatch:
     inputs:
       dry_run:
