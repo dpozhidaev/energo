@@ -77,6 +77,7 @@ class ConfigError(MonitorError, ValueError):
 @dataclass(frozen=True)
 class Config:
     check_time: str = '09:00'
+    backup_check_time: str = ''
     settlement: str = 'Пески'
     district: str = 'Выборгский'
     region_id: str = '344'
@@ -90,10 +91,16 @@ class Config:
             raise ConfigError('Все параметры config.json должны быть строками')
         if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', self.check_time):
             raise ConfigError('check_time должен иметь формат HH:MM, время Москвы')
+        if self.backup_check_time and not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', self.backup_check_time):
+            raise ConfigError('backup_check_time должен быть пустым или в формате HH:MM, время Москвы')
         if self.channel not in ('telegram', 'email'):
             raise ConfigError('channel должен быть telegram или email')
         if not self.settlement.strip() or not self.district.strip():
             raise ConfigError('settlement и district не могут быть пустыми')
+
+    @property
+    def check_times(self):
+        return [self.check_time] + ([self.backup_check_time] if self.backup_check_time else [])
 
     @property
     def params(self):
@@ -114,20 +121,21 @@ def load_config(path=DEFAULT_CONFIG):
 
 
 def write_schedules(config, root=None):
+    """Пишет расписание в Actions и systemd из check_time/backup_check_time (время Москвы)."""
     root = Path(root) if root else Path(__file__).parent
-    hour, minute = map(int, config.check_time.split(':'))
     workflow = root / '.github/workflows/check.yml'
-    text = workflow.read_text()
-    text, count = re.subn(r"cron: '[^']+'[^\n]*", f"cron: '{minute} {(hour - 3) % 24} * * *' # {config.check_time} Europe/Moscow", text)
+    entries = ''.join(f"    - cron: '{int(t[3:])} {int(t[:2])} * * *' # {t} Europe/Moscow\n"
+                      f'      timezone: "Europe/Moscow"\n' for t in config.check_times)
+    text, count = re.subn(r'(?m)^  schedule:\n(?:^    .*\n)+', '  schedule:\n' + entries, workflow.read_text())
     if count != 1:
-        raise ValueError('Ожидалось одно расписание в workflow')
+        raise ValueError('Ожидался один блок schedule в workflow')
     timer = root / 'deploy/peski-monitor.timer'
-    timer_text, count = re.subn(r'OnCalendar=[^\n]+', f'OnCalendar=*-*-* {config.check_time}:00 Europe/Moscow', timer.read_text())
+    lines = ''.join(f'OnCalendar=*-*-* {t}:00 Europe/Moscow\n' for t in config.check_times)
+    timer_text, count = re.subn(r'(?:OnCalendar=[^\n]+\n)+', lines, timer.read_text())
     if count != 1:
         raise ValueError('Не найдено расписание systemd')
     workflow.write_text(text)
     timer.write_text(timer_text)
-
 
 
 @dataclass(frozen=True)
