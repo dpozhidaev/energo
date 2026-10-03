@@ -10,5 +10,7 @@ EnvironmentFile=/etc/peski-monitor.env
 ExecStart=/opt/peski-monitor/.venv/bin/python /opt/peski-monitor/monitor.py
 NoNewPrivileges=true
 ProtectSystem=strict
+# monitor.py пишет sent.json и runs.log рядом с собой
+ReadWritePaths=/opt/peski-monitor
 ProtectHome=true
 PrivateTmp=true

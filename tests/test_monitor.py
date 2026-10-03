@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -58,16 +59,31 @@ class Tests(unittest.TestCase):
             m.save_sent_state(['1', '2'], path)
             self.assertEqual(m.load_sent_state(path), ['1', '2'])
 
-    def test_filter_unsent_skips_known_record_ids(self):
+    def test_filter_unsent_matches_record_and_its_times(self):
         row1 = m.Outage('1', 'addr', datetime(2026, 10, 5, tzinfo=m.MSK), datetime(2026, 10, 5, 12, tzinfo=m.MSK), '')
         row2 = m.Outage('2', 'addr', datetime(2026, 10, 6, tzinfo=m.MSK), datetime(2026, 10, 6, 12, tzinfo=m.MSK), '')
-        self.assertEqual(m.filter_unsent([row1, row2], ['1']), [row2])
+        sent = m.update_sent_state([], [row1])
+        self.assertEqual(sent, ['1|2026-10-05T00:00|2026-10-05T12:00'])
+        self.assertEqual(m.filter_unsent([row1, row2], sent), [row2])
+
+    def test_rescheduled_record_is_sent_again_and_marked(self):
+        old = m.Outage('7', 'Пески', datetime(2026, 10, 5, 11, tzinfo=m.MSK), datetime(2026, 10, 5, 17, tzinfo=m.MSK), '')
+        moved = m.Outage('7', 'Пески', datetime(2026, 10, 8, 11, tzinfo=m.MSK), datetime(2026, 10, 8, 17, tzinfo=m.MSK), '')
+        fresh = m.Outage('8', 'Пески', datetime(2026, 10, 9, 11, tzinfo=m.MSK), datetime(2026, 10, 9, 17, tzinfo=m.MSK), '')
+        sent = m.update_sent_state([], [old])
+        new_rows = m.filter_unsent([moved, fresh], sent)
+        self.assertEqual(new_rows, [moved, fresh])
+        changed = m.rescheduled_ids(new_rows, sent)
+        self.assertEqual(changed, {'7'})
+        texts = m.messages(new_rows, datetime(2026, 10, 2, 9, tzinfo=m.MSK), m.Config(), changed)
+        self.assertTrue(texts[0].startswith('<b>⚡ Плановое отключение электричества: изменено время!</b>\n08.10.2026'))
+        self.assertTrue(texts[1].startswith('<b>⚡ Плановое отключение электричества!</b>\n'))
 
     def test_update_sent_state_keeps_only_last_n(self):
         rows = [m.Outage(str(i), 'addr', datetime(2026, 10, 5, tzinfo=m.MSK), datetime(2026, 10, 5, 12, tzinfo=m.MSK), '')
                 for i in range(3)]
-        sent = ['old1', 'old2']
-        self.assertEqual(m.update_sent_state(sent, rows, limit=4), ['old2', '0', '1', '2'])
+        state = m.update_sent_state(['old1', 'old2'], rows, limit=4)
+        self.assertEqual(state, ['old2'] + [m.sent_key(r) for r in rows])
 
     def test_messages_one_per_record_with_fixed_address(self):
         config = m.Config()
@@ -200,100 +216,123 @@ class Tests(unittest.TestCase):
         self.assertEqual(m.fetch_candidate_proxies(session), [])
 
     def test_socks_proxies_resolve_names_remotely(self):
-        with patch.object(m.requests, 'get', return_value=Mock(text='<table class="tableous_facts">')):
-            self.assertEqual(m.probe_proxy('socks4', '1.2.3.4:1080')['https'], 'socks4a://1.2.3.4:1080')
-            self.assertEqual(m.probe_proxy('http', '1.2.3.4:8080')['https'], 'http://1.2.3.4:8080')
+        self.assertEqual(m.proxy_url('socks5', '1.2.3.4:1080'), 'socks5h://1.2.3.4:1080')
+        self.assertEqual(m.proxy_url('socks4', '1.2.3.4:1080'), 'socks4a://1.2.3.4:1080')
+        self.assertEqual(m.proxy_url('http', '1.2.3.4:8080'), 'http://1.2.3.4:8080')
 
-    @patch.object(m.requests, 'get')
-    def test_probe_proxy_checks_real_content(self, get):
-        get.return_value = Mock(text='<table class="tableous_facts">...</table>')
-        self.assertEqual(m.probe_proxy('socks5', '1.2.3.4:1080'),
-                          {'http': 'socks5h://1.2.3.4:1080', 'https': 'socks5h://1.2.3.4:1080'})
-        get.return_value = Mock(text='<html>blocked</html>')
-        self.assertIsNone(m.probe_proxy('socks5', '1.2.3.4:1080'))
-        get.side_effect = requests.exceptions.ConnectTimeout()
-        self.assertIsNone(m.probe_proxy('socks5', '1.2.3.4:1080'))
-
-    @patch.object(m, 'probe_proxy')
-    @patch.object(m, 'fetch_candidate_proxies')
-    def test_iter_working_proxies_yields_only_working_ones(self, fetch_candidates, probe_proxy):
-        fetch_candidates.return_value = [('http', '1.1.1.1:80'), ('socks5', '2.2.2.2:1080')]
-        probe_proxy.side_effect = lambda scheme, address, config=m.Config(): (
-            {'http': f'{scheme}://{address}', 'https': f'{scheme}://{address}'} if address == '2.2.2.2:1080' else None)
-        found = list(m.iter_working_proxies(Mock()))
-        self.assertEqual([p['https'] for p in found], ['socks5://2.2.2.2:1080'])
-
-    @patch.object(m, 'probe_proxy', return_value=None)
-    @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', '1.1.1.1:80')])
-    def test_iter_working_proxies_empty_without_any_match(self, fetch_candidates, probe_proxy):
-        self.assertEqual(list(m.iter_working_proxies(Mock())), [])
-
-    @patch.object(m, 'fetch_candidate_proxies', return_value=[])
-    def test_iter_working_proxies_raises_without_candidates(self, fetch_candidates):
-        with self.assertRaises(RuntimeError):
-            list(m.iter_working_proxies(Mock()))
-
-    @patch.object(m, 'iter_working_proxies')
-    def test_collect_with_fallback_switches_to_proxy_on_direct_failure(self, iter_proxies):
-        proxy = {'http': 'http://1.2.3.4:8080', 'https': 'http://1.2.3.4:8080'}
-        iter_proxies.return_value = iter([proxy])
-        session = Mock()
-        session.proxies = {}
-        session.get.side_effect = [requests.exceptions.ConnectionError(), Mock(text=page())]
-        rows = m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(session.proxies, proxy)
-
-    @patch.object(m, 'iter_working_proxies')
-    def test_collect_with_fallback_moves_on_when_proxy_times_out(self, iter_proxies):
-        slow = {'http': 'socks5://1.1.1.1:1080', 'https': 'socks5://1.1.1.1:1080'}
-        good = {'http': 'socks5://2.2.2.2:1080', 'https': 'socks5://2.2.2.2:1080'}
-        iter_proxies.return_value = iter([slow, good])
-        session = Mock()
-        session.proxies = {}
-        session.get.side_effect = [requests.exceptions.ConnectionError(),   # напрямую
-                                   requests.exceptions.ReadTimeout(),       # первый прокси завис
-                                   Mock(text=page())]                       # второй отдал страницу
-        rows = m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(session.proxies, good)
-
-    @patch.object(m, 'iter_working_proxies')
-    def test_collect_with_fallback_gives_up_after_max_attempts(self, iter_proxies):
-        proxies = [{'http': f'socks5://10.0.0.{i}:1080', 'https': f'socks5://10.0.0.{i}:1080'}
-                   for i in range(m.MAX_PROXY_ATTEMPTS + 3)]
-        iter_proxies.return_value = iter(proxies)
-        session = Mock()
-        session.proxies = {}
-        session.get.side_effect = requests.exceptions.ReadTimeout()
-        with self.assertRaises(RuntimeError):
-            m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
-        self.assertEqual(session.get.call_count, 1 + m.MAX_PROXY_ATTEMPTS)
-
-    @patch.object(m, 'iter_working_proxies', return_value=iter([]))
-    def test_collect_with_fallback_raises_when_no_proxy_found(self, iter_proxies):
-        session = Mock()
-        session.proxies = {}
-        session.get.side_effect = requests.exceptions.ConnectionError()
-        with self.assertRaises(RuntimeError):
-            m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
-
-    def test_collect_with_fallback_skips_proxy_search_when_direct_works(self):
-        session = Mock()
-        session.proxies = {}
-        session.get.return_value = Mock(text=page())
-        rows = m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(session.proxies, {})
-
-    def test_requests_use_short_timeout_and_do_not_retry_hangs(self):
+    def test_requests_fit_twenty_seconds_and_are_not_retried(self):
         session = Mock()
         session.get.return_value = Mock(text=page())
         m.collect(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
         self.assertEqual(session.get.call_args.kwargs['timeout'], m.REQUEST_TIMEOUT)
-        self.assertEqual(m.REQUEST_TIMEOUT[1], 20)
-        retries = m.site_session().get_adapter(m.BASE).max_retries
-        self.assertEqual((retries.connect, retries.read), (0, 0))
+        self.assertEqual(sum(m.REQUEST_TIMEOUT), 20)
+        self.assertEqual(m.site_session().get_adapter(m.BASE).max_retries.total, 0)
+        self.assertLess(m.FETCH_BUDGET, 15 * 60)
+
+    def test_read_pages_reports_progress_and_obeys_cancel(self):
+        session = Mock()
+        session.get.side_effect = [Mock(text=page(links='<a href="?PAGEN_1=2">2</a>')),
+                                   requests.exceptions.ReadTimeout()]
+        with self.assertRaises(requests.exceptions.ReadTimeout) as ctx:
+            m.read_pages(session, datetime(2026, 9, 30, tzinfo=m.MSK))
+        self.assertEqual(ctx.exception.pages_read, 1)
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(m._Cancelled):
+            m.read_pages(Mock(), datetime(2026, 9, 30, tzinfo=m.MSK), cancel=cancel)
+
+    def _direct_blocked_session(self):
+        session = Mock()
+        session.get.side_effect = requests.exceptions.ConnectionError()
+        return session
+
+    def test_collect_with_fallback_skips_proxy_search_when_direct_works(self):
+        session = Mock()
+        session.get.return_value = Mock(text=page())
+        with patch.object(m, 'fetch_candidate_proxies') as fetch:
+            rows = m.collect_with_fallback(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
+        self.assertEqual(len(rows), 1)
+        fetch.assert_not_called()
+
+    def test_direct_structure_error_is_reported_without_trying_proxies(self):
+        session = Mock()
+        session.get.return_value = Mock(text=page().replace('<td>uuid</td>', ''))
+        with patch.object(m, 'fetch_candidate_proxies') as fetch:
+            with self.assertRaises(m.SiteStructureError) as ctx:
+                m.collect_with_fallback(session, datetime(2026, 9, 30, tzinfo=m.MSK))
+        self.assertEqual(m.error_code(ctx.exception), 'E03')
+        fetch.assert_not_called()
+
+    @patch.object(m, 'fetch_via_proxy')
+    @patch.object(m, 'fetch_candidate_proxies')
+    def test_first_proxy_that_delivers_all_pages_wins(self, fetch_candidates, fetch_via_proxy):
+        fetch_candidates.return_value = [('socks5', f'10.0.0.{i}:1080') for i in range(30)]
+        row = m.parse_page(page())[0][0]
+
+        def worker(scheme, address, now, config, cancel):
+            if address != '10.0.0.17:1080':
+                raise requests.exceptions.ConnectTimeout()
+            return m.proxy_url(scheme, address), [row], 4
+        fetch_via_proxy.side_effect = worker
+        rows = m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
+        self.assertEqual(rows, [row])
+
+    @patch.object(m, 'fetch_via_proxy', side_effect=requests.exceptions.ConnectTimeout())
+    @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', '1.1.1.1:80'), ('http', '2.2.2.2:80')])
+    def test_e01_when_no_proxy_answers(self, fetch_candidates, fetch_via_proxy):
+        with self.assertRaises(m.NoProxyError) as ctx:
+            m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
+        self.assertIn('проверено 2 из 2', str(ctx.exception))
+
+    @patch.object(m, 'fetch_candidate_proxies', return_value=[])
+    def test_e01_when_proxy_lists_are_empty(self, fetch_candidates):
+        with self.assertRaises(m.NoProxyError):
+            m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
+
+    @patch.object(m, 'fetch_via_proxy')
+    @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', '1.1.1.1:80'), ('http', '2.2.2.2:80')])
+    def test_e02_when_proxies_reach_site_but_stall(self, fetch_candidates, fetch_via_proxy):
+        def worker(scheme, address, now, config, cancel):
+            exc = requests.exceptions.ReadTimeout()
+            exc.pages_read = 2 if address.startswith('1.') else 0
+            raise exc
+        fetch_via_proxy.side_effect = worker
+        with self.assertRaises(m.ProxiesFailedError) as ctx:
+            m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
+        self.assertIn('дошли до сайта: 1', str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, requests.exceptions.ReadTimeout)
+
+    @patch.object(m, 'fetch_via_proxy')
+    @patch.object(m, 'fetch_candidate_proxies')
+    def test_e03_when_two_proxies_return_unexpected_table(self, fetch_candidates, fetch_via_proxy):
+        fetch_candidates.return_value = [('http', f'10.0.0.{i}:80') for i in range(6)]
+        fetch_via_proxy.side_effect = m.SiteStructureError('Изменилась структура таблицы отключений')
+        with self.assertRaises(m.SiteStructureError) as ctx:
+            m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
+        self.assertEqual(m.error_code(ctx.exception), 'E03')
+
+    @patch.object(m, 'fetch_via_proxy', side_effect=m.TableMissingError('заглушка вместо таблицы'))
+    @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', f'10.0.0.{i}:80') for i in range(6)])
+    def test_stub_pages_from_proxies_are_not_a_site_change(self, fetch_candidates, fetch_via_proxy):
+        with self.assertRaises(m.NoProxyError):
+            m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
+
+    @patch.object(m, 'fetch_via_proxy')
+    @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', '1.1.1.1:80'), ('http', '2.2.2.2:80')])
+    def test_gives_up_when_time_budget_is_spent(self, fetch_candidates, fetch_via_proxy):
+        stopped = []
+
+        def worker(scheme, address, now, config, cancel):
+            stopped.append(cancel.wait(5))   # «зависший» прокси ждёт сигнала отмены
+            raise m._Cancelled()
+        fetch_via_proxy.side_effect = worker
+        with self.assertRaises(m.NoProxyError) as ctx:
+            m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK), budget=0.2)
+        self.assertIn('вышло время', str(ctx.exception))
+        for thread in threading.enumerate():
+            if thread is not threading.current_thread():
+                thread.join(2)
+        self.assertEqual(stopped, [True, True])   # потокам сообщили об отмене, они не висят
 
     @patch.dict(m.os.environ, {'TELEGRAM_BOT_TOKEN': 'test', 'TELEGRAM_CHAT_ID': '@channel',
                                'TELEGRAM_ERROR_CHAT_ID': '555'}, clear=True)
@@ -326,18 +365,18 @@ class Tests(unittest.TestCase):
         cases = [(m.NoProxyError('x'), 'E01'), (m.ProxiesFailedError('x'), 'E02'),
                  (m.SiteStructureError('x'), 'E03'), (m.TelegramError('x'), 'E04'),
                  (m.EmailError('x'), 'E05'), (m.ConfigError('x'), 'E06'), (KeyError('x'), 'E99')]
+        self.assertEqual(m.error_code(m.TableMissingError('x')), 'E03')
         for exc, code in cases:
             self.assertEqual(m.error_code(exc), code)
-        self.assertEqual(set(m.ERROR_TITLES), {c for _, c in cases})
+        self.assertEqual(set(m.ERROR_TITLES), {c for _, c in cases} | {'E98'})
 
     def test_raised_errors_carry_codes(self):
-        with self.assertRaises(m.SiteStructureError):
+        with self.assertRaises(m.TableMissingError):
             m.parse_page('<html>Service unavailable</html>')
+        with self.assertRaises(m.SiteStructureError):
+            m.parse_page(page(end='2026/10/01'))
         with self.assertRaises(m.ConfigError):
             m.Config(channel='sms')
-        with patch.object(m, 'fetch_candidate_proxies', return_value=[]):
-            with self.assertRaises(m.NoProxyError):
-                list(m.iter_working_proxies(Mock()))
         with patch.dict(m.os.environ, {}, clear=True):
             with self.assertRaises(m.ConfigError):
                 m.telegram('getMe', {})
@@ -404,13 +443,30 @@ class Tests(unittest.TestCase):
                 for i in range(150)]
         state = m.update_sent_state([], rows)
         self.assertEqual(len(state), 100)
-        self.assertEqual((state[0], state[-1]), ('50', '149'))
+        self.assertEqual((state[0], state[-1]), (m.sent_key(rows[50]), m.sent_key(rows[149])))
+
+    @patch.dict(m.os.environ, {'TELEGRAM_BOT_TOKEN': 'test', 'TELEGRAM_CHAT_ID': '@channel',
+                               'TELEGRAM_ERROR_CHAT_ID': '555'}, clear=True)
+    @patch.object(m, 'telegram')
+    def test_notify_owner_can_send_formatted_text(self, telegram):
+        m.notify_owner('<b>x</b>', m.Config(), parse_mode='HTML')
+        self.assertEqual(telegram.call_args.args[1]['chat_id'], '555')
+        self.assertEqual(telegram.call_args.args[1]['parse_mode'], 'HTML')
+
+    @patch.dict(m.os.environ, {'SMTP_HOST': 'smtp.example.org', 'SMTP_USER': 'a@example.org', 'SMTP_PASSWORD': 'x'}, clear=True)
+    @patch.object(m.smtplib, 'SMTP_SSL')
+    def test_email_gets_plain_text_instead_of_html(self, smtp):
+        m.send('<b>⚡ Заголовок</b>\nАдрес: ул &lt;Центр&gt; &amp; Co', m.Config(channel='email', email_to='x@example.org'),
+               parse_mode='HTML')
+        body = smtp.return_value.__enter__.return_value.send_message.call_args.args[0].get_content()
+        self.assertIn('⚡ Заголовок\nАдрес: ул <Центр> & Co', body)
+        self.assertNotIn('<b>', body)
 
     @patch.object(m, 'send')
     def test_notify_owner_for_email_uses_regular_destination(self, send):
         config = m.Config(channel='email', email_to='owner@example.org')
         m.notify_owner('boom', config)
-        send.assert_called_once_with('boom', config)
+        send.assert_called_once_with('boom', config, None)
 
 
 if __name__ == '__main__':

@@ -13,13 +13,13 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
+import time
 from urllib.parse import parse_qs, urlsplit, urlencode
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 BASE = 'https://rosseti-lenenergo.ru/planned_work/'
 CA = Path(__file__).parent / 'certs/russian_trusted_root_ca.pem'
@@ -38,12 +38,13 @@ GEONODE_URL = 'https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sor
 # Коды ошибок для сообщения владельцу. Базовые классы сохранены (ValueError/RuntimeError),
 # чтобы существующие except и тесты не менялись.
 ERROR_TITLES = {
-    'E01': 'нет рабочего прокси в РФ (сайт закрыт напрямую)',
-    'E02': 'прокси найдены, но ни один не отдал страницы сайта',
+    'E01': 'ни один прокси в РФ не ответил (сайт закрыт напрямую)',
+    'E02': 'прокси отвечали, но ни один не отдал все страницы сайта',
     'E03': 'страница сайта в неожиданном виде (сменилась разметка или заглушка вместо таблицы)',
     'E04': 'не удалось отправить сообщение в Telegram (токен, chat_id или сеть)',
     'E05': 'не удалось отправить email (настройки SMTP)',
     'E06': 'ошибка настроек (config.json или не заданы токен/chat_id)',
+    'E98': 'сбой окружения запуска в Actions (установка, тесты или обрыв по времени)',
     'E99': 'неизвестная ошибка',
 }
 
@@ -62,6 +63,10 @@ class ProxiesFailedError(MonitorError, RuntimeError):
 
 class SiteStructureError(MonitorError, ValueError):
     code = 'E03'
+
+
+class TableMissingError(SiteStructureError):
+    """В ответе нет таблицы отключений: через прокси это чаще заглушка, чем смена разметки."""
 
 
 class TelegramError(MonitorError, RuntimeError):
@@ -158,7 +163,7 @@ def parse_page(html, config=Config()):
     soup = BeautifulSoup(html, 'html.parser')
     table = soup.select_one('table.tableous_facts')
     if table is None:
-        raise SiteStructureError('Таблица отключений не найдена: возможно, сайт изменился или недоступен')
+        raise TableMissingError('Таблица отключений не найдена: возможно, сайт изменился или недоступен')
     headers = clean(table.get_text(' ', strip=True)).lower()
     for required in ('адрес', 'плановое время начала', 'плановое время восстановления'):
         if required not in headers:
@@ -179,8 +184,11 @@ def parse_page(html, config=Config()):
         matches = [a for a in addresses if settlement.search(a)]
         if not matches:
             continue
-        start = datetime.strptime(vals[3] + ' ' + vals[4], '%d-%m-%Y %H:%M').replace(tzinfo=MSK)
-        end = datetime.strptime(vals[5] + ' ' + vals[6], '%d-%m-%Y %H:%M').replace(tzinfo=MSK)
+        try:
+            start = datetime.strptime(vals[3] + ' ' + vals[4], '%d-%m-%Y %H:%M').replace(tzinfo=MSK)
+            end = datetime.strptime(vals[5] + ' ' + vals[6], '%d-%m-%Y %H:%M').replace(tzinfo=MSK)
+        except ValueError:
+            raise SiteStructureError('Неожиданный формат даты или времени в таблице') from None
         if end < start:
             raise SiteStructureError('Время окончания отключения раньше начала')
         # Только строки адреса, где встречается сам посёлок — остальные посёлки общей записи не нужны.
@@ -199,18 +207,19 @@ def parse_page(html, config=Config()):
     return outages, set(range(1, max(pages) + 1)), tuple(ids)
 
 
-# Соединение / ожидание ответа, секунд: не отвечает за это время — идём дальше (другой прокси).
-REQUEST_TIMEOUT = (10, 20)
-MAX_PROXY_ATTEMPTS = 20
+# Соединение / ожидание ответа, секунд (в сумме 20): не уложился — берём другой прокси.
+REQUEST_TIMEOUT = (6, 14)
+# Общий предел на получение страниц (прямой доступ и перебор прокси). Он меньше лимита workflow
+# (15 минут), чтобы отчёт владельцу успел уйти, а не оборвался вместе с задачей.
+FETCH_BUDGET = 9 * 60
+PROXY_WORKERS = 20
 
 
-def site_session():
+def site_session(proxies=None):
     session = requests.Session()
     session.headers['User-Agent'] = 'PeskiOutageMonitor/1.0 (daily personal notification)'
-    # Повторяем только ответы 429/5xx; зависание или обрыв не повторяем — это решает смена прокси.
-    retry = Retry(total=3, connect=0, read=0, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=['GET'])
-    session.mount('https://', HTTPAdapter(max_retries=retry))
+    if proxies:
+        session.proxies.update(proxies)
     return session
 
 
@@ -265,81 +274,110 @@ def fetch_candidate_proxies(session):
     return unique
 
 
-def probe_proxy(scheme, address, config=Config()):
-    """Проверяет, отдаёт ли прокси настоящую страницу отключений (а не блокировку/заглушку)."""
-    url_scheme = REMOTE_DNS_SCHEME.get(scheme, scheme)
-    proxies = {'http': f'{url_scheme}://{address}', 'https': f'{url_scheme}://{address}'}
+class _Cancelled(Exception):
+    """Страницы уже получены другим потоком или вышло время."""
+
+
+def read_pages(session, now, config=Config(), cancel=None):
+    """Читает все страницы; возвращает (актуальные записи, число страниц)."""
+    pending, visited, signatures, result = {1}, set(), set(), {}
     try:
-        response = requests.get(BASE, params=config.params, proxies=proxies, timeout=REQUEST_TIMEOUT, verify=str(CA))
-        response.raise_for_status()
-    except requests.RequestException:
-        return None
-    return proxies if 'tableous_facts' in response.text else None
-
-
-def iter_working_proxies(session, config=Config(), limit=80, max_workers=20):
-    """Отдаёт рабочие российские прокси из открытых списков по мере проверки (параллельно)."""
-    candidates = fetch_candidate_proxies(session)[:limit]
-    if not candidates:
-        raise NoProxyError('Не удалось получить список прокси для РФ')
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    try:
-        futures = [pool.submit(probe_proxy, scheme, address, config) for scheme, address in candidates]
-        for future in concurrent.futures.as_completed(futures):
-            proxies = future.result()
-            if proxies:
-                yield proxies
-    finally:
-        # Не ждём медленные/зависшие проверки остальных кандидатов, когда прокси уже выбран.
-        pool.shutdown(wait=False, cancel_futures=True)
-
-
-def collect_with_fallback(session, now, config=Config()):
-    """Сначала пробует прямой доступ; при недоступности перебирает рабочие российские прокси.
-
-    Прокси, который прошёл проверку, но завис или оборвался на реальных страницах, пропускается:
-    берём следующий (не больше MAX_PROXY_ATTEMPTS)."""
-    try:
-        return collect(session, now, config)
-    except (requests.RequestException, ValueError):
-        pass
-    attempts, last_error = 0, None
-    for proxies in iter_working_proxies(session, config):
-        attempts += 1
-        session.proxies.update(proxies)
-        print(f'Прямой доступ к сайту недоступен; пробую прокси {proxies["https"]}')
-        try:
-            return collect(session, now, config)
-        except (requests.RequestException, ValueError) as exc:
-            last_error = exc
-            print(f'Прокси {proxies["https"]} не сработал ({type(exc).__name__}), беру следующий')
-            if attempts >= MAX_PROXY_ATTEMPTS:
-                break
-    if attempts == 0:
-        raise NoProxyError('Не найден работающий прокси в РФ')
-    raise ProxiesFailedError(f'Ни один из {attempts} прокси не отдал страницы сайта') from last_error
+        while pending:
+            if cancel is not None and cancel.is_set():
+                raise _Cancelled()
+            page = min(pending)
+            pending.remove(page)
+            # Ссылки сайта теряют фильтры: переносим только номер страницы.
+            response = session.get(BASE, params={**config.params, 'PAGEN_1': page}, timeout=REQUEST_TIMEOUT, verify=str(CA))
+            response.raise_for_status()
+            response.encoding = 'utf-8'
+            rows, pages, signature = parse_page(response.text, config)
+            if signature and signature in signatures:
+                raise SiteStructureError('Сайт повторяет страницу вместо перехода к следующей')
+            signatures.add(signature)
+            visited.add(page)
+            pending.update(pages - visited)
+            for row in rows:
+                if row.end > now:
+                    result[row.record_id] = row
+    except (requests.RequestException, ValueError) as exc:
+        exc.pages_read = len(visited)
+        raise
+    return sorted(result.values(), key=lambda r: (r.start, r.record_id)), len(visited)
 
 
 def collect(session, now, config=Config()):
-    pending, visited, signatures, result = {1}, set(), set(), {}
-    while pending:
-        page = min(pending)
-        pending.remove(page)
-        # Ссылки сайта теряют фильтры: переносим только номер страницы.
-        response = session.get(BASE, params={**config.params, 'PAGEN_1': page}, timeout=REQUEST_TIMEOUT, verify=str(CA))
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-        rows, pages, signature = parse_page(response.text, config)
-        if signature and signature in signatures:
-            raise SiteStructureError('Сайт повторяет страницу вместо перехода к следующей')
-        signatures.add(signature)
-        visited.add(page)
-        pending.update(pages - visited)
-        for row in rows:
-            if row.end > now:
-                result[row.record_id] = row
-    print(f'Проверено страниц: {len(visited)}; актуальных записей ({config.label}): {len(result)}')
-    return sorted(result.values(), key=lambda r: (r.start, r.record_id))
+    rows, pages = read_pages(session, now, config)
+    print(f'Проверено страниц: {pages}; актуальных записей ({config.label}): {len(rows)}')
+    return rows
+
+
+def proxy_url(scheme, address):
+    return f'{REMOTE_DNS_SCHEME.get(scheme, scheme)}://{address}'
+
+
+def fetch_via_proxy(scheme, address, now, config, cancel):
+    url = proxy_url(scheme, address)
+    with site_session({'http': url, 'https': url}) as session:
+        rows, pages = read_pages(session, now, config, cancel)
+    return url, rows, pages
+
+
+def collect_with_fallback(session, now, config=Config(), budget=FETCH_BUDGET):
+    """Сначала прямой доступ; если сайт закрыт — параллельный перебор российских прокси.
+
+    Через каждого кандидата читаются сразу все страницы; побеждает первый, кто отдал их целиком.
+    Перебор идёт, пока не кончатся кандидаты или общий предел времени `budget`."""
+    deadline = time.monotonic() + budget
+    try:
+        return collect(session, now, config)
+    except TableMissingError:
+        pass
+    except SiteStructureError:
+        raise  # сайт ответил напрямую настоящей таблицей, но в неожиданном виде
+    except (requests.RequestException, ValueError):
+        pass
+    candidates = fetch_candidate_proxies(session)
+    if not candidates:
+        raise NoProxyError('Не удалось получить список прокси для РФ')
+    print(f'Прямой доступ к сайту недоступен; перебираю прокси, кандидатов: {len(candidates)}')
+    cancel = threading.Event()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=PROXY_WORKERS)
+    tried = reached = structure_errors = 0
+    last_error, timed_out = None, False
+    try:
+        futures = [pool.submit(fetch_via_proxy, scheme, address, now, config, cancel) for scheme, address in candidates]
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=max(0, deadline - time.monotonic())):
+                tried += 1
+                try:
+                    url, rows, pages = future.result()
+                except TableMissingError as exc:
+                    reached += bool(getattr(exc, 'pages_read', 0))
+                    last_error = exc
+                except SiteStructureError as exc:
+                    reached += 1
+                    structure_errors += 1
+                    last_error = exc
+                    if structure_errors >= 2:
+                        raise  # два разных прокси отдали таблицу в неожиданном виде — дело в сайте
+                except Exception as exc:
+                    reached += bool(getattr(exc, 'pages_read', 0))
+                    last_error = exc
+                else:
+                    print(f'Страницы получены через прокси {url} (проверено кандидатов: {tried} из {len(candidates)})')
+                    print(f'Проверено страниц: {pages}; актуальных записей ({config.label}): {len(rows)}')
+                    return rows
+        except concurrent.futures.TimeoutError:
+            timed_out = True
+    finally:
+        # Потоки проверяют флаг перед каждой страницей и сами завершаются; ждать их не нужно.
+        cancel.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+    detail = f'проверено {tried} из {len(candidates)}' + (f', вышло время ({budget // 60} мин)' if timed_out else '')
+    if reached:
+        raise ProxiesFailedError(f'Ни один прокси не отдал все страницы сайта ({detail}; дошли до сайта: {reached})') from last_error
+    raise NoProxyError(f'Ни один прокси не ответил ({detail})') from last_error
 
 
 SENT_STATE_LIMIT = 100
@@ -356,13 +394,24 @@ def save_sent_state(state, path=DEFAULT_SENT_STATE):
     Path(path).write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 
 
+def sent_key(row):
+    """Запись с теми же датами считается уже отправленной; перенос времени — новое уведомление."""
+    return f'{row.record_id}|{row.start:%Y-%m-%dT%H:%M}|{row.end:%Y-%m-%dT%H:%M}'
+
+
 def filter_unsent(rows, sent):
-    return [row for row in rows if row.record_id not in sent]
+    return [row for row in rows if sent_key(row) not in sent]
+
+
+def rescheduled_ids(rows, sent):
+    """record_id, по которым уведомление уже было, но с другим временем."""
+    known = {entry.split('|')[0] for entry in sent}
+    return {row.record_id for row in rows if row.record_id in known}
 
 
 def update_sent_state(sent, new_rows, limit=SENT_STATE_LIMIT):
-    """Хранит только последние `limit` отправленных record_id, чтобы sent.json не рос бесконечно."""
-    return (sent + [row.record_id for row in new_rows])[-limit:]
+    """Хранит только последние `limit` отправленных записей, чтобы sent.json не рос бесконечно."""
+    return (sent + [sent_key(row) for row in new_rows])[-limit:]
 
 
 def address_line(row, config=Config()):
@@ -376,7 +425,7 @@ def address_line(row, config=Config()):
     return f'пос.{config.label}'
 
 
-def messages(rows, now, config=Config()):
+def messages(rows, now, config=Config(), rescheduled=frozenset()):
     # Одно сообщение на запись: интересует только сам факт и время отключения в конкретном
     # посёлке, а не полный (часто на 10+ посёлков) список адресов из ячейки сайта.
     texts = []
@@ -385,7 +434,9 @@ def messages(rows, now, config=Config()):
         # экранируем, иначе его спецсимволы сломают разметку или собьют всё сообщение.
         address = html.escape(address_line(row, config))
         comment = html.escape(row.comment) if row.comment else 'не указан'
-        text = (f'<b>⚡ Плановое отключение электричества!</b>\n'
+        title = ('Плановое отключение электричества: изменено время!' if row.record_id in rescheduled
+                 else 'Плановое отключение электричества!')
+        text = (f'<b>⚡ {title}</b>\n'
                 f'{row.start:%d.%m.%Y %H:%M} — {row.end:%d.%m.%Y %H:%M} МСК\n'
                 f'Адрес: {address}\n'
                 f'Комментарий: {comment}\n'
@@ -429,6 +480,8 @@ def send(text, config=Config(), parse_mode=None):
             payload['parse_mode'] = parse_mode
         telegram('sendMessage', payload)
         return
+    if parse_mode == 'HTML':
+        text = html.unescape(re.sub(r'</?b>', '', text))  # письмо уходит обычным текстом
     message = EmailMessage()
     message['Subject'] = f'Отключения электричества: {config.label}'
     message['From'] = os.environ.get('SMTP_FROM') or os.environ['SMTP_USER']
@@ -444,19 +497,22 @@ def send(text, config=Config(), parse_mode=None):
         raise EmailError('Не удалось отправить email: проверьте настройки SMTP') from None
 
 
-def notify_owner(text, config=Config()):
+def notify_owner(text, config=Config(), parse_mode=None):
     """Служебные сообщения (ошибки, отчёты о запусках) — только владельцу, не в общий канал.
 
     Для Telegram получатель — TELEGRAM_ERROR_CHAT_ID; если не задан, сообщение остаётся
     только в журнале запуска. Для email уходит на тот же адрес, что и обычные письма."""
     if config.channel != 'telegram':
-        send(text, config)
+        send(text, config, parse_mode)
         return
     chat = os.environ.get('TELEGRAM_ERROR_CHAT_ID', '').strip()
     if not chat:
         print('TELEGRAM_ERROR_CHAT_ID не задан: служебное сообщение не отправлено', file=sys.stderr)
         return
-    telegram('sendMessage', dict(chat_id=chat, text=text, link_preview_options={'is_disabled': True}))
+    payload = dict(chat_id=chat, text=text, link_preview_options={'is_disabled': True})
+    if parse_mode:
+        payload['parse_mode'] = parse_mode
+    telegram('sendMessage', payload)
 
 
 RUN_SOURCES = {'schedule': 'по расписанию', 'workflow_dispatch': 'вручную из Actions'}
@@ -532,14 +588,14 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Показать сводку без отправки')
     parser.add_argument('--chat-id', action='store_true', help='Показать ID приватного чата после /start')
     parser.add_argument('--test-message', action='store_true', help='Отправить проверочное сообщение')
-    parser.add_argument('--sample-message', action='store_true', help='Отправить пример сообщения об отключении текущим форматом')
+    parser.add_argument('--sample-message', action='store_true', help='Отправить владельцу пример сообщения об отключении')
     args = parser.parse_args()
     config = None
     try:
         config = load_config(args.config)
         if args.write_schedules:
             write_schedules(config)
-            print(f"Расписания обновлены: {config.check_time} МСК")
+            print(f"Расписания обновлены: {', '.join(config.check_times)} МСК")
             return 0
         if args.chat_id:
             chats = {u['message']['chat']['id'] for u in telegram('getUpdates', {})
@@ -557,8 +613,9 @@ def main():
             sample = Outage('332251', 'п Пески, ул Пихтовая; п Пески, ул Благодатная',
                             datetime(2026, 9, 25, 9, 0, tzinfo=MSK), datetime(2026, 9, 25, 17, 0, tzinfo=MSK),
                             'Замена КТП 2073')
+            # Только владельцу: в общем канале пример выглядел бы как настоящее отключение.
             for text in messages([sample], now, config):
-                send(text, config, parse_mode='HTML')
+                notify_owner(text, config, parse_mode='HTML')
             return 0
         if not args.dry_run:
             validate_destination(config)
@@ -570,13 +627,15 @@ def main():
         new_rows = filter_unsent(rows, sent)
         if len(new_rows) != len(rows):
             print(f'Уже отправлено ранее, пропущено: {len(rows) - len(new_rows)}')
-        for row, text in zip(new_rows, messages(new_rows, now, config)):
+        for row, text in zip(new_rows, messages(new_rows, now, config, rescheduled_ids(new_rows, sent))):
             if args.dry_run:
                 print(text)
-            else:
-                send(text, config, parse_mode='HTML')
+                continue
+            send(text, config, parse_mode='HTML')
+            # Сохраняем сразу: если следующая отправка упадёт, эта запись не уйдёт повторно.
+            sent = update_sent_state(sent, [row])
+            save_sent_state(sent)
         if not args.dry_run:
-            save_sent_state(update_sent_state(sent, new_rows))
             record_run(now, f'OK: актуальных {len(rows)}, новых {len(new_rows)}')
             try:
                 notify_owner(run_report(now, len(rows), len(new_rows), config), config)

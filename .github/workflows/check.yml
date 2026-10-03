@@ -16,7 +16,7 @@ on:
         type: boolean
         default: false
       sample_message:
-        description: 'Send a sample outage message (current wording/format) instead of checking the site'
+        description: 'Send a sample outage message to the owner chat only (not the channel)'
         type: boolean
         default: false
 permissions:
@@ -29,12 +29,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
+      - id: deps
+        run: pip install -r requirements.txt
+      - id: tests
+        run: python -m unittest discover -s tests -v
       - name: Send test message
         if: github.event_name == 'workflow_dispatch' && inputs.test_message && !inputs.sample_message
         run: python monitor.py --test-message
@@ -53,6 +55,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ERROR_CHAT_ID: ${{ secrets.TELEGRAM_ERROR_CHAT_ID }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -84,4 +87,16 @@ jobs:
             git commit -m 'Update state and run log'
             git pull --rebase -q origin main
             git push
+          fi
+      # monitor.py сам сообщает об ошибках проверки; этот шаг — про то, до чего он не дошёл.
+      - name: Notify owner about a broken run
+        if: always() && (steps.deps.outcome == 'failure' || steps.tests.outcome == 'failure' || cancelled())
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ERROR_CHAT_ID: ${{ secrets.TELEGRAM_ERROR_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_ERROR_CHAT_ID" ]; then
+            curl -sS -o /dev/null --max-time 30 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_ERROR_CHAT_ID}" \
+              --data-urlencode "text=⚠️ Ошибка E98: сбой окружения запуска в Actions (установка, тесты или обрыв по времени). Проверка отключений не выполнена. Журнал: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           fi
