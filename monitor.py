@@ -519,8 +519,14 @@ RUN_SOURCES = {'schedule': 'по расписанию', 'workflow_dispatch': 'в
 
 
 def run_source():
-    """Что запустило проверку; для расписания добавляется сработавший cron (SCHEDULE_CRON из workflow)."""
+    """Что запустило проверку; для расписания добавляется сработавший cron (SCHEDULE_CRON из workflow).
+
+    RUN_TRIGGER — параметр `source` ручного запуска: его передаёт внешний планировщик (cron-job.org),
+    чтобы такой запуск не выглядел как нажатие кнопки в Actions."""
     source = RUN_SOURCES.get(os.environ.get('GITHUB_EVENT_NAME', ''), 'локально')
+    external = ' '.join(os.environ.get('RUN_TRIGGER', '').split())[:40]
+    if external:
+        source = f'внешний планировщик {external}'
     cron = os.environ.get('SCHEDULE_CRON', '').strip()
     return f'{source}, cron {cron}' if cron else source
 

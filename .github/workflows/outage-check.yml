@@ -19,6 +19,10 @@ on:
         description: 'Send a sample outage message to the owner chat only (not the channel)'
         type: boolean
         default: false
+      source:
+        description: 'Name of the external scheduler that triggered this run (e.g. cron-job.org); empty for a manual run'
+        type: string
+        default: ''
 permissions:
   contents: write
 concurrency:
@@ -64,11 +68,14 @@ jobs:
       - name: Check without sending
         if: github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.test_message && !inputs.sample_message
         run: python monitor.py --dry-run
+        env:
+          RUN_TRIGGER: ${{ inputs.source }}
       - name: Send notifications
         if: github.event_name != 'workflow_dispatch' || (!inputs.dry_run && !inputs.test_message && !inputs.sample_message)
         run: python monitor.py
         env:
           SCHEDULE_CRON: ${{ github.event.schedule }}
+          RUN_TRIGGER: ${{ inputs.source }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_ERROR_CHAT_ID: ${{ secrets.TELEGRAM_ERROR_CHAT_ID }}

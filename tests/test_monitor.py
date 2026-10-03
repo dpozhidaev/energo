@@ -414,6 +414,17 @@ class Tests(unittest.TestCase):
         with patch.dict(m.os.environ, {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'SCHEDULE_CRON': ''}, clear=True):
             self.assertEqual(m.run_stamp(now), 'Запуск: 03.10.2026 17:45 МСК (вручную из Actions)')
 
+    def test_external_scheduler_is_named_in_stamp_and_log(self):
+        now = datetime(2026, 10, 4, 11, 45, tzinfo=m.MSK)
+        env = {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'RUN_TRIGGER': 'cron-job.org'}
+        with patch.dict(m.os.environ, env, clear=True):
+            self.assertEqual(m.run_stamp(now), 'Запуск: 04.10.2026 11:45 МСК (внешний планировщик cron-job.org)')
+            self.assertEqual(m.run_log_line(now, 'OK: актуальных 0, новых 0'),
+                             '2026-10-04 11:45 МСК | внешний планировщик cron-job.org | OK: актуальных 0, новых 0')
+        with patch.dict(m.os.environ, {'GITHUB_EVENT_NAME': 'workflow_dispatch', 'RUN_TRIGGER': ' a\nb ' + 'x' * 100}, clear=True):
+            self.assertNotIn('\n', m.run_source())
+            self.assertLessEqual(len(m.run_source()), len('внешний планировщик ') + 40)
+
     def test_run_log_line_is_single_line_and_bounded(self):
         now = datetime(2026, 10, 3, 17, 45, tzinfo=m.MSK)
         with patch.dict(m.os.environ, {'GITHUB_EVENT_NAME': 'schedule', 'SCHEDULE_CRON': '45 17 * * *'}, clear=True):
