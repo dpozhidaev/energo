@@ -1,8 +1,7 @@
 [Unit]
 Description=Check Peski outages daily (Moscow time, see OnCalendar)
 [Timer]
-OnCalendar=*-*-* 11:45:00 Europe/Moscow
-OnCalendar=*-*-* 17:45:00 Europe/Moscow
+OnCalendar=*-*-* 09:15:00 Europe/Moscow
 Persistent=true
 AccuracySec=1s
 [Install]
