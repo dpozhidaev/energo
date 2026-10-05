@@ -11,18 +11,20 @@ class ConfigTests(unittest.TestCase):
     def test_defaults(self):
         c = m.Config()
         self.assertEqual(c.proxy_workers, 2)
+        self.assertEqual(c.url, 'https://rosseti-lenenergo.ru/planned_work/')
+        self.assertEqual(m.Config(url='https://example.org/list/').source, 'https://example.org/list/?reg=344&res=370')
         self.assertEqual(c.settlement, 'Пески')
         self.assertEqual(c.email_to, '')
 
     def test_custom_settlement_and_district(self):
         c = m.Config(settlement='Рощино', district='Выборгский', res_id='')
-        self.assertEqual(len(m.parse_page(page('п Рощино, ул Центральная'), c)[0]), 1)
-        self.assertEqual(m.parse_page(page(), c)[0], [])
-        self.assertEqual(m.parse_page(page('п Рощино', district='р-н Лужский'), c)[0], [])
+        self.assertEqual(len(m.parse_page(page('п Рощино, ул Центральная'), c)), 1)
+        self.assertEqual(m.parse_page(page(), c), [])
+        self.assertEqual(m.parse_page(page('п Рощино', district='р-н Лужский'), c), [])
         self.assertEqual(c.params['res'], '')
 
     def test_invalid_config(self):
-        for values in [dict(channel='sms'), dict(settlement=''), dict(region_id=344),
+        for values in [dict(channel='sms'), dict(settlement=''), dict(region_id=344), dict(url='http://example.org/'),
                        dict(proxy_workers=0), dict(proxy_workers=21), dict(proxy_workers='2'), dict(proxy_workers=True)]:
             with self.assertRaises(ValueError):
                 m.Config(**values)
@@ -31,6 +33,7 @@ class ConfigTests(unittest.TestCase):
         root = Path(m.__file__).parent
         config = m.load_config()
         self.assertEqual(config.proxy_workers, 5)
+        self.assertEqual(config.url, 'https://rosseti-lenenergo.ru/planned_work/')
         workflow = (root / '.github/workflows/outage-check.yml').read_text(encoding='utf-8')
         self.assertNotIn('cron:', workflow)        # время запуска задаёт внешний планировщик
         self.assertIn('workflow_dispatch:', workflow)

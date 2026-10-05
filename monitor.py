@@ -15,13 +15,12 @@ import re
 import sys
 import threading
 import time
-from urllib.parse import parse_qs, urlsplit, urlencode
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 import requests
 
-BASE = 'https://rosseti-lenenergo.ru/planned_work/'
 CA = Path(__file__).parent / 'certs/russian_trusted_root_ca.pem'
 MSK = ZoneInfo('Europe/Moscow')
 DEFAULT_CONFIG = Path(__file__).parent / 'config.json'
@@ -39,7 +38,7 @@ GEONODE_URL = 'https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sor
 # чтобы существующие except и тесты не менялись.
 ERROR_TITLES = {
     'E01': 'ни один прокси в РФ не ответил (сайт закрыт напрямую)',
-    'E02': 'прокси отвечали, но ни один не отдал все страницы сайта',
+    'E02': 'прокси отвечали, но страницу сайта не отдал ни один (блокировка или заглушка)',
     'E03': 'страница сайта в неожиданном виде (сменилась разметка или заглушка вместо таблицы)',
     'E04': 'не удалось отправить сообщение в Telegram (токен, chat_id или сеть)',
     'E05': 'не удалось отправить email (настройки SMTP)',
@@ -86,6 +85,7 @@ class ConfigError(MonitorError, ValueError):
 
 @dataclass(frozen=True)
 class Config:
+    url: str = 'https://rosseti-lenenergo.ru/planned_work/'
     settlement: str = 'Пески'
     district: str = 'Выборгский'
     region_id: str = '344'
@@ -102,6 +102,8 @@ class Config:
             raise ConfigError(f'proxy_workers должен быть целым числом от 1 до {MAX_PROXY_WORKERS}')
         if not all(isinstance(v, str) for k, v in self.__dict__.items() if k != 'proxy_workers'):
             raise ConfigError('Параметры config.json, кроме proxy_workers, должны быть строками')
+        if not self.url.startswith('https://'):
+            raise ConfigError('url должен начинаться с https://')
         if self.channel not in ('telegram', 'email'):
             raise ConfigError('channel должен быть telegram или email')
         if not self.settlement.strip() or not self.district.strip():
@@ -113,7 +115,7 @@ class Config:
 
     @property
     def source(self):
-        return BASE + '?' + urlencode({'reg': self.region_id, 'res': self.res_id})
+        return self.url + '?' + urlencode({'reg': self.region_id, 'res': self.res_id})
 
     @property
     def label(self):
@@ -148,7 +150,7 @@ def parse_page(html, config=Config()):
     for required in ('адрес', 'плановое время начала', 'плановое время восстановления'):
         if required not in headers:
             raise SiteStructureError('Изменилась структура таблицы отключений')
-    outages, ids = [], []
+    outages = []
     for row in table.select('tbody tr'):
         cells = row.find_all('td', recursive=False)
         if not cells:
@@ -156,7 +158,6 @@ def parse_page(html, config=Config()):
         if len(cells) != 11 or not row.get('data-record-id'):
             raise SiteStructureError('Неожиданная строка в таблице; результат не считается пустым')
         vals = [clean(c.get_text(' ', strip=True)) for c in cells]
-        ids.append(row['data-record-id'])
         # Проверяем район и населённый пункт, а не произвольное упоминание в комментарии.
         addresses = [clean(s) for s in cells[2].get_text('|', strip=True).split('|')]
         if not re.search(r'(?<!\w)' + re.escape(config.district) + r'(?!\w)', vals[1], re.I):
@@ -173,18 +174,7 @@ def parse_page(html, config=Config()):
             raise SiteStructureError('Время окончания отключения раньше начала')
         # Только строки адреса, где встречается сам посёлок — остальные посёлки общей записи не нужны.
         outages.append(Outage(row['data-record-id'], '; '.join(matches), start, end, vals[9]))
-    pages = {1}
-    for link in soup.select('a[href]'):
-        label = link.get_text(strip=True)
-        # У сайта есть ошибочная стрелка «следующая» даже на последней странице.
-        if not (label.isdigit() or label == '»'):
-            continue
-        for value in parse_qs(urlsplit(link['href']).query).get('PAGEN_1', []):
-            if value.isdigit() and int(value) > 0:
-                pages.add(int(value))
-    if max(pages) > 100:
-        raise SiteStructureError('Слишком много страниц; требуется проверка сайта')
-    return outages, set(range(1, max(pages) + 1)), tuple(ids)
+    return outages
 
 
 # Соединение / ожидание ответа, секунд (в сумме 20): не уложился — берём другой прокси.
@@ -254,40 +244,24 @@ def fetch_candidate_proxies(session):
 
 
 class _Cancelled(Exception):
-    """Страницы уже получены другим потоком или вышло время."""
+    """Страница уже получена другим потоком или вышло время."""
 
 
-def read_pages(session, now, config=Config(), cancel=None):
-    """Читает все страницы; возвращает (актуальные записи, число страниц)."""
-    pending, visited, signatures, result = {1}, set(), set(), {}
-    try:
-        while pending:
-            if cancel is not None and cancel.is_set():
-                raise _Cancelled()
-            page = min(pending)
-            pending.remove(page)
-            # Ссылки сайта теряют фильтры: переносим только номер страницы.
-            response = session.get(BASE, params={**config.params, 'PAGEN_1': page}, timeout=REQUEST_TIMEOUT, verify=str(CA))
-            response.raise_for_status()
-            response.encoding = 'utf-8'
-            rows, pages, signature = parse_page(response.text, config)
-            if signature and signature in signatures:
-                raise SiteStructureError('Сайт повторяет страницу вместо перехода к следующей')
-            signatures.add(signature)
-            visited.add(page)
-            pending.update(pages - visited)
-            for row in rows:
-                if row.end > now:
-                    result[row.record_id] = row
-    except (requests.RequestException, ValueError) as exc:
-        exc.pages_read = len(visited)
-        raise
-    return sorted(result.values(), key=lambda r: (r.start, r.record_id)), len(visited)
+def read_outages(session, now, config=Config()):
+    """Актуальные записи с первой страницы списка.
+
+    Сайт выводит записи от новых к старым, поэтому будущие и идущие отключения стоят в её начале;
+    остальные страницы — архив."""
+    response = session.get(config.url, params=config.params, timeout=REQUEST_TIMEOUT, verify=str(CA))
+    response.raise_for_status()
+    response.encoding = 'utf-8'
+    rows = {row.record_id: row for row in parse_page(response.text, config) if row.end > now}
+    return sorted(rows.values(), key=lambda r: (r.start, r.record_id))
 
 
 def collect(session, now, config=Config()):
-    rows, pages = read_pages(session, now, config)
-    print(f'Проверено страниц: {pages}; актуальных записей ({config.label}): {len(rows)}')
+    rows = read_outages(session, now, config)
+    print(f'Актуальных записей ({config.label}): {len(rows)}')
     return rows
 
 
@@ -296,16 +270,17 @@ def proxy_url(scheme, address):
 
 
 def fetch_via_proxy(scheme, address, now, config, cancel):
+    if cancel.is_set():
+        raise _Cancelled()
     url = proxy_url(scheme, address)
     with site_session({'http': url, 'https': url}) as session:
-        rows, pages = read_pages(session, now, config, cancel)
-    return url, rows, pages
+        return url, read_outages(session, now, config)
 
 
 def collect_with_fallback(session, now, config=Config(), budget=FETCH_BUDGET):
     """Сначала прямой доступ; если сайт закрыт — параллельный перебор российских прокси.
 
-    Через каждого кандидата читаются сразу все страницы; побеждает первый, кто отдал их целиком.
+    Побеждает первый кандидат, отдавший страницу с таблицей.
     Перебор идёт, пока не кончатся кандидаты или общий предел времени `budget`."""
     deadline = time.monotonic() + budget
     try:
@@ -331,9 +306,9 @@ def collect_with_fallback(session, now, config=Config(), budget=FETCH_BUDGET):
             for future in concurrent.futures.as_completed(futures, timeout=max(0, deadline - time.monotonic())):
                 tried += 1
                 try:
-                    url, rows, pages = future.result()
-                except TableMissingError as exc:
-                    reached += bool(getattr(exc, 'pages_read', 0))
+                    url, rows = future.result()
+                except (TableMissingError, requests.HTTPError) as exc:
+                    reached += 1  # прокси ответил, но не страницей с таблицей
                     last_error = exc
                 except SiteStructureError as exc:
                     reached += 1
@@ -342,21 +317,20 @@ def collect_with_fallback(session, now, config=Config(), budget=FETCH_BUDGET):
                     if structure_errors >= 2:
                         raise  # два разных прокси отдали таблицу в неожиданном виде — дело в сайте
                 except Exception as exc:
-                    reached += bool(getattr(exc, 'pages_read', 0))
                     last_error = exc
                 else:
-                    print(f'Страницы получены через прокси {url} (проверено кандидатов: {tried} из {len(candidates)})')
-                    print(f'Проверено страниц: {pages}; актуальных записей ({config.label}): {len(rows)}')
+                    print(f'Страница получена через прокси {url} (проверено кандидатов: {tried} из {len(candidates)})')
+                    print(f'Актуальных записей ({config.label}): {len(rows)}')
                     return rows
         except concurrent.futures.TimeoutError:
             timed_out = True
     finally:
-        # Потоки проверяют флаг перед каждой страницей и сами завершаются; ждать их не нужно.
+        # Начатые запросы сами завершатся по таймауту; ждать их не нужно.
         cancel.set()
         pool.shutdown(wait=False, cancel_futures=True)
     detail = f'проверено {tried} из {len(candidates)}' + (f', вышло время ({budget // 60} мин)' if timed_out else '')
     if reached:
-        raise ProxiesFailedError(f'Ни один прокси не отдал все страницы сайта ({detail}; дошли до сайта: {reached})') from last_error
+        raise ProxiesFailedError(f'Ни один прокси не отдал страницу сайта ({detail}; ответили: {reached})') from last_error
     raise NoProxyError(f'Ни один прокси не ответил ({detail})') from last_error
 
 

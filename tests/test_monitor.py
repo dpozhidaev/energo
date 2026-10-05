@@ -17,16 +17,12 @@ def page(address='п Пески, ул Пихтовая', district='р-н Выб�
 
 class Tests(unittest.TestCase):
     def test_multiple_settlements(self):
-        self.assertEqual(len(m.parse_page(page('Яппиля<br>Пески<br>Зеркальный'))[0]), 1)
-
-    def test_last_page_broken_next_arrow(self):
-        links = '<a href="?PAGEN_1=4">»</a><a class="next" href="?PAGEN_1=5"></a>'
-        self.assertEqual(m.parse_page(page(links=links))[1], {1, 2, 3, 4})
+        self.assertEqual(len(m.parse_page(page('Яппиля<br>Пески<br>Зеркальный'))), 1)
 
     def test_false_matches(self):
         for address in ['п Пескино', 'п Песочный', 'п Рощино, ул Пески', 'СНТ Пески']:
-            self.assertEqual(m.parse_page(page(address))[0], [])
-        self.assertEqual(m.parse_page(page(district='р-н Лужский'))[0], [])
+            self.assertEqual(m.parse_page(page(address)), [])
+        self.assertEqual(m.parse_page(page(district='р-н Лужский')), [])
 
     def test_markup_failure(self):
         with self.assertRaises(ValueError):
@@ -34,20 +30,28 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.parse_page(page().replace('<td>uuid</td>', ''))
 
-    def test_pages_preserve_filters_and_expired(self):
+    def test_only_first_page_is_requested_with_filters(self):
         session = Mock()
-        responses = [page(end='30-09-2026', links='<a href="?PAGEN_1=2">2</a>'), page(record='2')]
-        session.get.side_effect = [Mock(text=text) for text in responses]
-        rows = m.collect(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
-        self.assertEqual([r.record_id for r in rows], ['2'])
+        session.get.return_value = Mock(text=page(links='<a href="?PAGEN_1=2">2</a><a href="?PAGEN_1=4">»</a>'))
+        config = m.Config()
+        rows = m.collect(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK), config)
+        self.assertEqual([r.record_id for r in rows], ['1'])
+        self.assertEqual(session.get.call_count, 1)   # ссылки на другие страницы не обходим
+        self.assertEqual(session.get.call_args.args[0], config.url)
         self.assertEqual(session.get.call_args.kwargs['params']['res'], '370')
-        self.assertEqual(session.get.call_args.kwargs['params']['PAGEN_1'], 2)
+        self.assertNotIn('PAGEN_1', session.get.call_args.kwargs['params'])
 
-    def test_repeated_page_is_error(self):
+    def test_finished_outages_are_skipped(self):
         session = Mock()
-        session.get.return_value = Mock(text=page(links='<a href="?PAGEN_1=2">2</a>'))
-        with self.assertRaises(ValueError):
-            m.collect(session, datetime(2026, 9, 30, tzinfo=m.MSK))
+        session.get.return_value = Mock(text=page(end='30-09-2026'))   # закончилось 30.09 в 17:00
+        self.assertEqual(m.collect(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK)), [])
+        self.assertEqual(len(m.collect(session, datetime(2026, 9, 30, 12, tzinfo=m.MSK))), 1)
+
+    def test_site_address_comes_from_config(self):
+        session = Mock()
+        session.get.return_value = Mock(text=page())
+        m.collect(session, datetime(2026, 9, 30, tzinfo=m.MSK), m.Config(url='https://example.org/outages/'))
+        self.assertEqual(session.get.call_args.args[0], 'https://example.org/outages/')
 
     def test_no_results_no_messages(self):
         self.assertEqual(m.messages([], datetime.now(m.MSK)), [])
@@ -154,8 +158,8 @@ class Tests(unittest.TestCase):
         html = ('<table class="tableous_facts"><thead><tr><th>Адрес Плановое время начала '
                 'Плановое время восстановления</th></tr></thead><tbody>' + real_row + '</tbody></table>')
         config = m.Config()
-        rows, _, ids = m.parse_page(html, config)
-        self.assertEqual(ids, ('332251',))
+        rows = m.parse_page(html, config)
+        self.assertEqual([r.record_id for r in rows], ['332251'])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].address, 'п Пески, ул Пихтовая; п Пески, ул Благодатная')
         now = datetime(2026, 9, 24, 9, 0, tzinfo=m.MSK)
@@ -184,7 +188,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(m.address_line(row, config), 'п Пески, ул Пихтовая; п Пески, ул Благодатная, Выборгский район')
 
     def test_messages_truncated_to_telegram_limit(self):
-        row = m.parse_page(page())[0][0]
+        row = m.parse_page(page())[0]
         long_comment = m.Outage(row.record_id, row.address, row.start, row.end, 'а' * 10000)
         texts = m.messages([long_comment], datetime.now(m.MSK))
         self.assertEqual(len(texts), 1)
@@ -226,20 +230,16 @@ class Tests(unittest.TestCase):
         m.collect(session, datetime(2026, 9, 30, 18, tzinfo=m.MSK))
         self.assertEqual(session.get.call_args.kwargs['timeout'], m.REQUEST_TIMEOUT)
         self.assertEqual(sum(m.REQUEST_TIMEOUT), 20)
-        self.assertEqual(m.site_session().get_adapter(m.BASE).max_retries.total, 0)
+        self.assertEqual(m.site_session().get_adapter(m.Config().url).max_retries.total, 0)
         self.assertLess(m.FETCH_BUDGET, 15 * 60)
 
-    def test_read_pages_reports_progress_and_obeys_cancel(self):
-        session = Mock()
-        session.get.side_effect = [Mock(text=page(links='<a href="?PAGEN_1=2">2</a>')),
-                                   requests.exceptions.ReadTimeout()]
-        with self.assertRaises(requests.exceptions.ReadTimeout) as ctx:
-            m.read_pages(session, datetime(2026, 9, 30, tzinfo=m.MSK))
-        self.assertEqual(ctx.exception.pages_read, 1)
+    def test_cancelled_worker_does_not_touch_the_site(self):
         cancel = threading.Event()
         cancel.set()
-        with self.assertRaises(m._Cancelled):
-            m.read_pages(Mock(), datetime(2026, 9, 30, tzinfo=m.MSK), cancel=cancel)
+        with patch.object(m, 'site_session') as site_session:
+            with self.assertRaises(m._Cancelled):
+                m.fetch_via_proxy('socks5', '1.2.3.4:1080', datetime(2026, 9, 30, tzinfo=m.MSK), m.Config(), cancel)
+        site_session.assert_not_called()
 
     def _direct_blocked_session(self):
         session = Mock()
@@ -267,12 +267,12 @@ class Tests(unittest.TestCase):
     @patch.object(m, 'fetch_candidate_proxies')
     def test_first_proxy_that_delivers_all_pages_wins(self, fetch_candidates, fetch_via_proxy):
         fetch_candidates.return_value = [('socks5', f'10.0.0.{i}:1080') for i in range(30)]
-        row = m.parse_page(page())[0][0]
+        row = m.parse_page(page())[0]
 
         def worker(scheme, address, now, config, cancel):
             if address != '10.0.0.17:1080':
                 raise requests.exceptions.ConnectTimeout()
-            return m.proxy_url(scheme, address), [row], 4
+            return m.proxy_url(scheme, address), [row]
         fetch_via_proxy.side_effect = worker
         rows = m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
         self.assertEqual(rows, [row])
@@ -312,16 +312,15 @@ class Tests(unittest.TestCase):
 
     @patch.object(m, 'fetch_via_proxy')
     @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', '1.1.1.1:80'), ('http', '2.2.2.2:80')])
-    def test_e02_when_proxies_reach_site_but_stall(self, fetch_candidates, fetch_via_proxy):
+    def test_e02_when_proxies_answer_without_the_page(self, fetch_candidates, fetch_via_proxy):
         def worker(scheme, address, now, config, cancel):
-            exc = requests.exceptions.ReadTimeout()
-            exc.pages_read = 2 if address.startswith('1.') else 0
-            raise exc
+            if address.startswith('1.'):
+                raise requests.exceptions.HTTPError('403 Forbidden')   # прокси ответил, но сайт не пустил
+            raise requests.exceptions.ConnectTimeout()
         fetch_via_proxy.side_effect = worker
         with self.assertRaises(m.ProxiesFailedError) as ctx:
             m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
-        self.assertIn('дошли до сайта: 1', str(ctx.exception))
-        self.assertIsInstance(ctx.exception.__cause__, requests.exceptions.ReadTimeout)
+        self.assertIn('ответили: 1', str(ctx.exception))
 
     @patch.object(m, 'fetch_via_proxy')
     @patch.object(m, 'fetch_candidate_proxies')
@@ -335,8 +334,9 @@ class Tests(unittest.TestCase):
     @patch.object(m, 'fetch_via_proxy', side_effect=m.TableMissingError('заглушка вместо таблицы'))
     @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', f'10.0.0.{i}:80') for i in range(6)])
     def test_stub_pages_from_proxies_are_not_a_site_change(self, fetch_candidates, fetch_via_proxy):
-        with self.assertRaises(m.NoProxyError):
+        with self.assertRaises(m.ProxiesFailedError) as ctx:   # E02, а не E03
             m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
+        self.assertEqual(m.error_code(ctx.exception), 'E02')
 
     @patch.object(m, 'fetch_via_proxy')
     @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', '1.1.1.1:80'), ('http', '2.2.2.2:80')])
