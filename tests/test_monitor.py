@@ -277,6 +277,27 @@ class Tests(unittest.TestCase):
         rows = m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK))
         self.assertEqual(rows, [row])
 
+    @patch.object(m, 'fetch_via_proxy')
+    @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', f'10.0.0.{i}:80') for i in range(12)])
+    def test_parallelism_follows_proxy_workers_setting(self, fetch_candidates, fetch_via_proxy):
+        lock, state = threading.Lock(), {'now': 0, 'peak': 0}
+
+        def worker(scheme, address, now, config, cancel):
+            with lock:
+                state['now'] += 1
+                state['peak'] = max(state['peak'], state['now'])
+            threading.Event().wait(0.03)
+            with lock:
+                state['now'] -= 1
+            raise requests.exceptions.ConnectTimeout()
+        fetch_via_proxy.side_effect = worker
+        for workers in (1, 3):
+            state.update(now=0, peak=0)
+            with self.assertRaises(m.NoProxyError):
+                m.collect_with_fallback(self._direct_blocked_session(), datetime(2026, 9, 30, tzinfo=m.MSK),
+                                        m.Config(proxy_workers=workers))
+            self.assertEqual(state['peak'], workers)
+
     @patch.object(m, 'fetch_via_proxy', side_effect=requests.exceptions.ConnectTimeout())
     @patch.object(m, 'fetch_candidate_proxies', return_value=[('http', '1.1.1.1:80'), ('http', '2.2.2.2:80')])
     def test_e01_when_no_proxy_answers(self, fetch_candidates, fetch_via_proxy):

@@ -1,8 +1,7 @@
 name: Peski daily outage check
+# Плановый запуск GitHub отключён: он опаздывал на часы. Проверку в нужное время запускает
+# внешний планировщик (cron-job.org) через workflow_dispatch — см. README.
 on:
-  schedule:
-    - cron: '15 9 * * *' # 09:15 Europe/Moscow
-      timezone: "Europe/Moscow"
   workflow_dispatch:
     inputs:
       dry_run:

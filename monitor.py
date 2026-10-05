@@ -49,6 +49,9 @@ ERROR_TITLES = {
 }
 
 
+MAX_PROXY_WORKERS = 20
+
+
 class MonitorError(Exception):
     code = 'E99'
 
@@ -83,8 +86,6 @@ class ConfigError(MonitorError, ValueError):
 
 @dataclass(frozen=True)
 class Config:
-    check_time: str = '09:00'
-    backup_check_time: str = ''
     settlement: str = 'Пески'
     district: str = 'Выборгский'
     region_id: str = '344'
@@ -92,22 +93,19 @@ class Config:
     channel: str = 'telegram'
     telegram_chat_id: str = ''
     email_to: str = ''
+    # Сколько прокси проверяется одновременно: столько же параллельных запросов уходит на сайт.
+    proxy_workers: int = 2
 
     def __post_init__(self):
-        if not all(isinstance(v, str) for v in self.__dict__.values()):
-            raise ConfigError('Все параметры config.json должны быть строками')
-        if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', self.check_time):
-            raise ConfigError('check_time должен иметь формат HH:MM, время Москвы')
-        if self.backup_check_time and not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', self.backup_check_time):
-            raise ConfigError('backup_check_time должен быть пустым или в формате HH:MM, время Москвы')
+        workers = self.proxy_workers
+        if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= MAX_PROXY_WORKERS:
+            raise ConfigError(f'proxy_workers должен быть целым числом от 1 до {MAX_PROXY_WORKERS}')
+        if not all(isinstance(v, str) for k, v in self.__dict__.items() if k != 'proxy_workers'):
+            raise ConfigError('Параметры config.json, кроме proxy_workers, должны быть строками')
         if self.channel not in ('telegram', 'email'):
             raise ConfigError('channel должен быть telegram или email')
         if not self.settlement.strip() or not self.district.strip():
             raise ConfigError('settlement и district не могут быть пустыми')
-
-    @property
-    def check_times(self):
-        return [self.check_time] + ([self.backup_check_time] if self.backup_check_time else [])
 
     @property
     def params(self):
@@ -125,24 +123,6 @@ class Config:
 def load_config(path=DEFAULT_CONFIG):
     data = json.loads(Path(path).read_text(encoding='utf-8'))
     return Config(**data)
-
-
-def write_schedules(config, root=None):
-    """Пишет расписание в Actions и systemd из check_time/backup_check_time (время Москвы)."""
-    root = Path(root) if root else Path(__file__).parent
-    workflow = root / '.github/workflows/outage-check.yml'
-    entries = ''.join(f"    - cron: '{int(t[3:])} {int(t[:2])} * * *' # {t} Europe/Moscow\n"
-                      f'      timezone: "Europe/Moscow"\n' for t in config.check_times)
-    text, count = re.subn(r'(?m)^  schedule:\n(?:^    .*\n)+', '  schedule:\n' + entries, workflow.read_text())
-    if count != 1:
-        raise ValueError('Ожидался один блок schedule в workflow')
-    timer = root / 'deploy/peski-monitor.timer'
-    lines = ''.join(f'OnCalendar=*-*-* {t}:00 Europe/Moscow\n' for t in config.check_times)
-    timer_text, count = re.subn(r'(?:OnCalendar=[^\n]+\n)+', lines, timer.read_text())
-    if count != 1:
-        raise ValueError('Не найдено расписание systemd')
-    workflow.write_text(text)
-    timer.write_text(timer_text)
 
 
 @dataclass(frozen=True)
@@ -212,7 +192,6 @@ REQUEST_TIMEOUT = (6, 14)
 # Общий предел на получение страниц (прямой доступ и перебор прокси). Он меньше лимита workflow
 # (15 минут), чтобы отчёт владельцу успел уйти, а не оборвался вместе с задачей.
 FETCH_BUDGET = 9 * 60
-PROXY_WORKERS = 20
 
 
 def site_session(proxies=None):
@@ -340,9 +319,10 @@ def collect_with_fallback(session, now, config=Config(), budget=FETCH_BUDGET):
     candidates = fetch_candidate_proxies(session)
     if not candidates:
         raise NoProxyError('Не удалось получить список прокси для РФ')
-    print(f'Прямой доступ к сайту недоступен; перебираю прокси, кандидатов: {len(candidates)}')
+    print(f'Прямой доступ к сайту недоступен; перебираю прокси, кандидатов: {len(candidates)}, '
+          f'потоков: {config.proxy_workers}')
     cancel = threading.Event()
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=PROXY_WORKERS)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=config.proxy_workers)
     tried = reached = structure_errors = 0
     last_error, timed_out = None, False
     try:
@@ -590,7 +570,6 @@ def run_report(now, found, sent, config=Config()):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG, help='Файл настроек JSON')
-    parser.add_argument('--write-schedules', action='store_true', help='Обновить Actions и systemd из check_time')
     parser.add_argument('--dry-run', action='store_true', help='Показать сводку без отправки')
     parser.add_argument('--chat-id', action='store_true', help='Показать ID приватного чата после /start')
     parser.add_argument('--test-message', action='store_true', help='Отправить проверочное сообщение')
@@ -599,10 +578,6 @@ def main():
     config = None
     try:
         config = load_config(args.config)
-        if args.write_schedules:
-            write_schedules(config)
-            print(f"Расписания обновлены: {', '.join(config.check_times)} МСК")
-            return 0
         if args.chat_id:
             chats = {u['message']['chat']['id'] for u in telegram('getUpdates', {})
                      if u.get('message', {}).get('chat', {}).get('type') == 'private'}
@@ -651,7 +626,7 @@ def main():
         return 0
     except Exception as exc:
         print(f'Ошибка {error_code(exc)}: {type(exc).__name__}: {exc}', file=sys.stderr)
-        if config is not None and not args.dry_run and not args.chat_id and not args.test_message and not args.sample_message and not args.write_schedules:
+        if config is not None and not args.dry_run and not args.chat_id and not args.test_message and not args.sample_message:
             failed_at = datetime.now(MSK)
             record_run(failed_at, f'ОШИБКА {error_code(exc)}: {type(exc).__name__}: {exc}')
             try:

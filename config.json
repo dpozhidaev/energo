@@ -1,9 +1,8 @@
 {
-  "check_time": "09:15",
-  "backup_check_time": "",
   "settlement": "Пески",
   "district": "Выборгский",
   "region_id": "344",
   "res_id": "370",
-  "channel": "telegram"
+  "channel": "telegram",
+  "proxy_workers": 2
 }
