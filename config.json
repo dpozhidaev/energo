@@ -4,5 +4,5 @@
   "region_id": "344",
   "res_id": "370",
   "channel": "telegram",
-  "proxy_workers": 2
+  "proxy_workers": 5
 }

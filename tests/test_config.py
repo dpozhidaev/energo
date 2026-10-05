@@ -30,7 +30,7 @@ class ConfigTests(unittest.TestCase):
     def test_committed_config_loads_and_workflow_has_no_schedule(self):
         root = Path(m.__file__).parent
         config = m.load_config()
-        self.assertEqual(config.proxy_workers, 2)
+        self.assertEqual(config.proxy_workers, 5)
         workflow = (root / '.github/workflows/outage-check.yml').read_text(encoding='utf-8')
         self.assertNotIn('cron:', workflow)        # время запуска задаёт внешний планировщик
         self.assertIn('workflow_dispatch:', workflow)
